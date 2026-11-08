@@ -18,6 +18,14 @@ pixel kernels).
   are shown Picasa-style, with "(n)" counts and date ranges; EXIF is read in the
   background. Tags are Picasa's `keywords=` in `.picasa.ini`, and the search box
   matches folders, tags and file names.
+* **Picasa's edit view**:
+  * Basic Fixes as icon tiles (Crop, Straighten with a levelling grid, I'm
+    Feeling Lucky, Auto Contrast, Auto Color), with Fill Light below.
+  * A live Histogram & Camera Information box.
+  * A "Make a caption!" line under the photo, stored as Picasa's `caption=`.
+  * A Tags panel: type a tag and press +, see the photo's tags, and use ten
+    Quick Tags (the gear configures them). A Quick Tag is bold when every photo
+    in the tray has it, and clicking it adds or removes the tag.
 * **Fast thumbnail cache** in SQLite (WAL mode), with JPEG blobs of 320 px on
   the long edge. Writes are batched, and each worker thread has its own read
   connection.
@@ -79,7 +87,7 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 
 | `.picasa.ini` key / filter | Status |
 |---|---|
-| `star=yes`, `rotate=rotate(n)`, `keywords=` (tags) | read + write |
+| `star=yes`, `rotate=rotate(n)`, `keywords=` (tags), `caption=` | read + write |
 | `filters=` chain, `redo=` (undo stack) | read + write, unknown entries kept verbatim |
 | `fill`, `finetune2` (fill, highlights, shadows, neutral colour, temperature) | rendered |
 | `autolight`, `autocolor`, `enhance` | rendered |

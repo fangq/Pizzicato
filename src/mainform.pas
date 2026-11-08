@@ -80,7 +80,16 @@ type
     Sliders: array[TSliderKind] of TTrackBar;
     CmbAspect: TComboBox;
     BtnCrop, BtnCropApply, BtnCropCancel, BtnPick: TBitBtn;
-    LblInfo: TLabel;
+    Hist: TPzHistogram;
+    PnlCaption: TPanel;
+    EdCaption: TEdit;
+    BtnStraighten: TSpeedButton;
+    PnlCropOpts, PnlStraighten: TPanel;
+    BtnEditTags: TSpeedButton;
+    LblTagsIn: TLabel;
+    QuickBtns: array[0..9] of TSpeedButton;
+    FQuickTags: TStringList;
+    BtnQuickCfg: TSpeedButton;
     Status: TStatusBar;
     TmrIni, TmrStatus: TTimer;
     { state }
@@ -108,6 +117,20 @@ type
     procedure BuildUI;
     procedure BuildEditPanel;
     procedure BuildBottomBar;
+    function AddTile(AParent: TWinControl; const ACaption, AIcon, AHint: string;
+      X, Y: Integer; H: TNotifyEvent): TSpeedButton;
+    procedure StraightenClick(Sender: TObject);
+    procedure CaptionKeyPress(Sender: TObject; var Key: Char);
+    procedure CaptionExit(Sender: TObject);
+    procedure SaveCaption;
+    procedure UpdateHistInfo;
+    procedure SyncPanelButtons;
+    procedure RightPagesChange(Sender: TObject);
+    procedure QuickTagClick(Sender: TObject);
+    procedure QuickCfgClick(Sender: TObject);
+    procedure RefreshQuickTags;
+    procedure SaveQuickTags;
+    procedure LstTagsKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure BuildRightPanel;
     procedure TrayPhotos(L: TList);
     procedure SelectionChanged;
@@ -248,6 +271,7 @@ begin
   Cache := TList.Create;
   Held := TList.Create;
   FTagNames := TStringList.Create;
+  FQuickTags := TStringList.Create;
   FDirtyFolders := TList.Create;
   CfgDir := GetEnvironmentVariable('HOME') + '/.config/pizzicato';
   ForceDirectories(CfgDir);
@@ -344,6 +368,7 @@ begin
   FEffNames.Free;
   Held.Free;
   FTagNames.Free;
+  FQuickTags.Free;
   Settings.Free;
   if FBenchLogOpen then
     CloseFile(FBenchLog);
@@ -365,6 +390,7 @@ begin
     RightPages.ActivePage := TabTags
   else
     RightPages.ActivePage := TabProps;
+  SyncPanelButtons;
   SelectionChanged;
   if FGenAll then
     Application.QueueAsyncCall(@RunGenAllAsync, 0)
@@ -564,6 +590,16 @@ var
   TS: TTabSheet;
   Y: Integer;
   B: TBitBtn;
+  P: TPanel;
+  BtnCropTile: TSpeedButton;
+
+  procedure EffTile(AParent: TWinControl; const Cap, Name, Tip: string; X, YY: Integer);
+  var
+    BB: TSpeedButton;
+  begin
+    BB := AddTile(AParent, Cap, Name, Tip, X, YY, @EffectClick);
+    BB.Tag := FEffNames.Add(Name);
+  end;
 
   procedure Eff(const Cap, Name, Tip: string; X, YY, WW: Integer);
   var
@@ -610,12 +646,23 @@ begin
   PnlTools.Align := alLeft;
   PnlTools.Width := 262;
   PnlTools.BevelOuter := bvNone;
+  { Picasa's "Histogram & Camera Information" box under the tools }
+  Hist := TPzHistogram.Create(Self);
+  Hist.Parent := PnlTools;
+  Hist.Align := alBottom;
+  Hist.Height := 166;
 
-  BtnUndo := AddButton(PnlTools, 'Undo', 6, 4, 80, @UndoClick, 'undo');
+  P := TPanel.Create(Self);
+  P.Parent := PnlTools;
+  P.Align := alTop;
+  P.Height := 38;
+  P.BevelOuter := bvNone;
+  P.ParentColor := True;
+  BtnUndo := AddButton(P, 'Undo', 6, 4, 80, @UndoClick, 'undo');
   BtnUndo.Hint := 'Undo the last edit (Ctrl+Z)';
-  BtnRedo := AddButton(PnlTools, 'Redo', 90, 4, 80, @RedoClick, 'redo');
+  BtnRedo := AddButton(P, 'Redo', 90, 4, 80, @RedoClick, 'redo');
   BtnRedo.Hint := 'Redo (Ctrl+Y)';
-  BtnUndoAll := AddButton(PnlTools, 'All', 174, 4, 82, @UndoAllClick, 'undoall');
+  BtnUndoAll := AddButton(P, 'All', 174, 4, 82, @UndoAllClick, 'undoall');
   BtnUndoAll.Hint := 'Undo all edits of this photo';
   PnlEdit.ShowHint := True;
   TabIcons := TImageList.Create(Self);
@@ -624,8 +671,7 @@ begin
 
   Pages := TPageControl.Create(Self);
   Pages.Parent := PnlTools;
-  Pages.SetBounds(0, 38, 262, 560);
-  Pages.Anchors := [akLeft, akTop, akRight, akBottom];
+  Pages.Align := alClient;
   Pages.TabStop := False;
   Pages.Images := TabIcons;
 
@@ -633,27 +679,66 @@ begin
   TS := Pages.AddTabSheet;
   TS.Caption := 'Basic';
   TabIcon('tab_basic');
-  BtnCrop := AddButton(TS, 'Crop', 8, 8, 112, @CropClick, 'crop');
+  { Picasa's Basic Fixes: a grid of tiles, then the options of the active tool }
+  P := TPanel.Create(Self);
+  P.Parent := TS;
+  P.Align := alTop;
+  P.Height := 156;
+  P.BevelOuter := bvNone;
+  P.ParentColor := True;
+  BtnCropTile := AddTile(P, 'Crop', 'crop', 'Crop the photo', 4, 4, @CropClick);
+  BtnStraighten := AddTile(P, 'Straighten', 'straighten', 'Level a tilted horizon',
+    86, 4, @StraightenClick);
+  BtnStraighten.GroupIndex := 7;
+  BtnStraighten.AllowAllUp := True;
+  EffTile(P, 'Feeling Lucky', 'enhance',
+    'I''m Feeling Lucky: automatic contrast and colour', 168, 4);
+  EffTile(P, 'Auto Contrast', 'autolight', 'Stretch the brightness range', 4, 80);
+  EffTile(P, 'Auto Color', 'autocolor', 'Remove a colour cast', 86, 80);
+
+  PnlCropOpts := TPanel.Create(Self);
+  PnlCropOpts.Parent := TS;
+  PnlCropOpts.Align := alTop;
+  PnlCropOpts.Top := 1000;
+  PnlCropOpts.Height := 76;
+  PnlCropOpts.BevelOuter := bvNone;
+  PnlCropOpts.ParentColor := True;
+  PnlCropOpts.Visible := False;
   CmbAspect := TComboBox.Create(Self);
-  CmbAspect.Parent := TS;
-  CmbAspect.SetBounds(128, 8, 116, 28);
+  CmbAspect.Parent := PnlCropOpts;
+  CmbAspect.SetBounds(8, 4, 236, 28);
   CmbAspect.Style := csDropDownList;
-  CmbAspect.Items.CommaText := 'Free,"4:3","3:2","16:9","1:1","5:4","3:4","2:3"';
+  CmbAspect.Items.CommaText :=
+    '"Free (drag on the photo)","4:3","3:2","16:9","1:1","5:4","3:4","2:3"';
   CmbAspect.ItemIndex := 0;
   CmbAspect.OnChange := @AspectChange;
   CmbAspect.TabStop := False;
-  BtnCropApply := AddButton(TS, 'Apply', 8, 40, 112, @CropApplyClick, 'apply');
+  BtnCropApply := AddButton(PnlCropOpts, 'Apply', 8, 40, 112, @CropApplyClick, 'apply');
   BtnCropApply.Hint := 'Apply the crop (Enter)';
-  BtnCropCancel := AddButton(TS, 'Cancel', 128, 40, 116, @CropCancelClick, 'cancel');
-  BtnCropApply.Enabled := False;
-  BtnCropCancel.Enabled := False;
-  Eff('I''m Feeling Lucky', 'enhance', 'Automatic contrast and colour in one click',
-    8, 78, 236);
-  Eff('Auto Contrast', 'autolight', 'Stretch the brightness range', 8, 110, 236);
-  Eff('Auto Color', 'autocolor', 'Remove a colour cast', 8, 142, 236);
-  Y := 182;
-  AddSlider(TS, 'Straighten', -100, 100, skTilt, Y);
-  AddSlider(TS, 'Fill Light', 0, 100, skFill, Y);
+  BtnCropCancel := AddButton(PnlCropOpts, 'Cancel', 128, 40, 116,
+    @CropCancelClick, 'cancel');
+  BtnCrop := BtnCropApply; // kept for older code paths
+
+  PnlStraighten := TPanel.Create(Self);
+  PnlStraighten.Parent := TS;
+  PnlStraighten.Align := alTop;
+  PnlStraighten.Top := 1100;
+  PnlStraighten.Height := 62;
+  PnlStraighten.BevelOuter := bvNone;
+  PnlStraighten.ParentColor := True;
+  PnlStraighten.Visible := False;
+  Y := 4;
+  AddSlider(PnlStraighten, 'Straighten (drag, the grid helps)', -100, 100, skTilt, Y);
+
+  P := TPanel.Create(Self);
+  P.Parent := TS;
+  P.Align := alTop;
+  P.Top := 1200;
+  P.Height := 64;
+  P.BevelOuter := bvNone;
+  P.ParentColor := True;
+  Y := 4;
+  AddSlider(P, 'Fill Light', 0, 100, skFill, Y);
 
   { Tuning }
   TS := Pages.AddTabSheet;
@@ -674,29 +759,39 @@ begin
   TS := Pages.AddTabSheet;
   TS.Caption := 'Effects';
   TabIcon('tab_effects');
-  Eff('Black && White', 'bw', 'Convert to black and white', 8, 8, 116);
-  Eff('Sepia', 'sepia', 'Old-photo brown tone', 128, 8, 116);
-  Eff('Warmify', 'warm', 'Warmer colours', 8, 40, 116);
-  Y := 80;
+  EffTile(TS, 'B && W', 'bw', 'Convert to black and white', 4, 4);
+  EffTile(TS, 'Sepia', 'sepia', 'Old-photo brown tone', 86, 4);
+  EffTile(TS, 'Warmify', 'warm', 'Warmer colours', 168, 4);
+  Y := 84;
   AddSlider(TS, 'Sharpen', 0, 100, skSharpen, Y);
   AddSlider(TS, 'Saturation', 0, 100, skSat, Y);
   AddSlider(TS, 'Boost', 0, 100, skBoost, Y);
   AddSlider(TS, 'Soft Focus', 0, 100, skSoft, Y);
   AddSlider(TS, 'Vignette', 0, 100, skVignette, Y);
 
-  LblInfo := TLabel.Create(Self);
-  LblInfo.Parent := PnlTools;
-  LblInfo.SetBounds(8, 604, 248, 200);
-  LblInfo.Anchors := [akLeft, akBottom];
-  LblInfo.AutoSize := False;
-  LblInfo.WordWrap := True;
-  LblInfo.Font.Color := clPzSub;
 
   Strip := TPzStrip.Create(Self);
   Strip.Parent := PnlEdit;
   Strip.Align := alBottom;
   Strip.Height := 84;
   Strip.OnPick := @StripPick;
+
+  { Picasa's caption line under the photo }
+  PnlCaption := TPanel.Create(Self);
+  PnlCaption.Parent := PnlEdit;
+  PnlCaption.Align := alBottom;
+  PnlCaption.Height := 32;
+  PnlCaption.Top := Strip.Top - 1;
+  PnlCaption.BevelOuter := bvNone;
+  PnlCaption.Color := TColor($1C1C1C);
+  EdCaption := TEdit.Create(Self);
+  EdCaption.Parent := PnlCaption;
+  EdCaption.Align := alClient;
+  EdCaption.BorderSpacing.Around := 3;
+  EdCaption.Alignment := taCenter;
+  EdCaption.TextHint := 'Make a caption!';
+  EdCaption.OnKeyPress := @CaptionKeyPress;
+  EdCaption.OnExit := @CaptionExit;
 
   Viewer := TPzViewer.Create(Self);
   Viewer.Parent := PnlEdit;
@@ -736,8 +831,12 @@ begin
         CachePut(R);
     end;
     jkProbe:
+    begin
       if PnlRight.Visible then
         QueueProps;
+      if FEditMode and (R.Photo = Cur) then
+        UpdateHistInfo;
+    end;
   end;
   if (R.Kind = jkThumb) and (Tray.Photos.IndexOf(R.Photo) >= 0) then
     Tray.Invalidate;
@@ -923,7 +1022,7 @@ begin
     PnlRight.Parent := PnlEdit
   else
     PnlRight.Parent := PnlLibrary;
-  BtnEditInfo.Down := PnlRight.Visible;
+  SyncPanelButtons;
   if AOn then
     Viewer.SetFocus
   else
@@ -1066,6 +1165,8 @@ begin
   if P = nil then
     Exit;
   if (Cur <> nil) and (Cur <> P) then
+    SaveCaption;
+  if (Cur <> nil) and (Cur <> P) then
     Viewer.SetMode(vmNormal);
   Cur := P;
   Inc(ViewToken);
@@ -1073,8 +1174,13 @@ begin
   FOpenT0 := NowSeconds;
   FFirstFullMs := -1;
   Viewer.Zoom100 := False;
-  BtnCropApply.Enabled := False;
-  BtnCropCancel.Enabled := False;
+  PnlCropOpts.Visible := False;
+  if BtnStraighten.Down then
+  begin
+    BtnStraighten.Down := False;
+    StraightenClick(nil);
+  end;
+
   P.Folder.EnsureIni;
   LblName.Caption := Format('%s    %s', [P.Name, P.Folder.Path]);
   if P.Star then BtnStar.Caption := 'Starred'
@@ -1082,6 +1188,10 @@ begin
     BtnStar.Caption := 'Star';
   Strip.SetCurrent(P);
   LoadSlidersFromChain;
+  EdCaption.Text := P.Caption;
+  Hist.Clear;
+  Lib.RequestProbe(P);
+  UpdateHistInfo;
   { drop stale prefetches, keep only what's useful now }
   Lib.CancelViews(-1);
   if CacheFind(P, 1) <> nil then
@@ -1137,6 +1247,7 @@ var
   T0, s: Double;
   W, H: Integer;
   Info: string;
+  HistData: Tpz_hist;
 begin
   if Cur = nil then
     Exit;
@@ -1164,6 +1275,8 @@ begin
       Img := Tmp;
     end;
   end;
+  pz_histogram(@Img, HistData);
+  Hist.SetHistogram(HistData);
   Viewer.SetImage(ImageToBitmap(Img));
   pz_free(@Img);
   FCurLevel := E.Level;
@@ -1370,8 +1483,11 @@ begin
   Viewer.Zoom100 := False;
   Viewer.SetMode(vmCrop);
   AspectChange(nil);
-  BtnCropApply.Enabled := True;
-  BtnCropCancel.Enabled := True;
+  BtnStraighten.Down := False;
+  StraightenClick(nil);
+  PnlCropOpts.Top := 157;
+  PnlCropOpts.Visible := True;
+
 end;
 
 procedure TMainForm.AspectChange(Sender: TObject);
@@ -1428,8 +1544,8 @@ end;
 procedure TMainForm.CropCancelClick(Sender: TObject);
 begin
   Viewer.SetMode(vmNormal);
-  BtnCropApply.Enabled := False;
-  BtnCropCancel.Enabled := False;
+  PnlCropOpts.Visible := False;
+
 end;
 
 procedure TMainForm.PickClick(Sender: TObject);
@@ -1878,12 +1994,17 @@ begin
   BtnEditInfo := Toggle(PnlEditTop, 'info', 'Properties', 0, 3);
   BtnEditInfo.SetBounds(472, 4, 38, 32);
   BtnEditInfo.OnClick := @ShowPanelClick;
-  LblName.Left := 520;
+  BtnEditTags := Toggle(PnlEditTop, 'tag', 'Tags (Ctrl+T)', 0, 3);
+  BtnEditTags.SetBounds(514, 4, 38, 32);
+  BtnEditTags.OnClick := @ShowPanelClick;
+  LblName.Left := 562;
 end;
 
 procedure TMainForm.BuildRightPanel;
 var
   L: TLabel;
+  P, Q, R: TPanel;
+  k: Integer;
 begin
   PnlRight := TPanel.Create(Self);
   PnlRight.Parent := PnlLibrary;
@@ -1914,28 +2035,108 @@ begin
   TabTags := RightPages.AddTabSheet;
   TabTags.Caption := 'Tags';
   TabTags.ImageIndex := PzAddToImageList(TabIcons, 'tag');
+  { as in Picasa: type a tag and press +, the tags of the photo below,
+    Quick Tags at the bottom }
+  P := TPanel.Create(Self);
+  P.Parent := TabTags;
+  P.Align := alTop;
+  P.Height := 88;
+  P.BevelOuter := bvNone;
+  P.ParentColor := True;
   L := TLabel.Create(Self);
-  L.Parent := TabTags;
+  L.Parent := P;
   L.SetBounds(8, 8, 270, 18);
-  L.Caption := 'Add tags to the photos in the tray:';
+  L.Caption := 'Type in a tag to add:';
+  { the edit and its + share a row; aligned, so the + stays at the right edge }
+  R := TPanel.Create(Self);
+  R.Parent := P;
+  R.SetBounds(0, 26, 300, 32);
+  R.Align := alTop;
+  R.BorderSpacing.Top := 26;
+  R.BevelOuter := bvNone;
+  R.ParentColor := True;
+  BtnAddTag := AddButton(R, '', 0, 0, 34, @AddTagClick, 'plus');
+  BtnAddTag.Align := alRight;
+  BtnAddTag.BorderSpacing.Right := 8;
   EdTag := TEdit.Create(Self);
-  EdTag.Parent := TabTags;
-  EdTag.SetBounds(8, 30, 190, 28);
+  EdTag.Parent := R;
+  EdTag.Align := alClient;
+  EdTag.BorderSpacing.Left := 8;
+  EdTag.BorderSpacing.Right := 4;
   EdTag.TextHint := 'tag1, tag2…';
   EdTag.OnKeyPress := @EdTagKeyPress;
-  BtnAddTag := AddButton(TabTags, 'Add', 204, 30, 80, @AddTagClick, 'tag');
+  BtnAddTag.Hint := 'Add the tag to the photos in the tray (Enter)';
+  LblTagsIn := TLabel.Create(Self);
+  LblTagsIn.Parent := P;
+  LblTagsIn.SetBounds(8, 66, 276, 18);
+  LblTagsIn.Align := alBottom;
+  LblTagsIn.BorderSpacing.Left := 8;
+  LblTagsIn.BorderSpacing.Bottom := 4;
+  LblTagsIn.Caption := 'Tags in the selection:';
+
+  Q := TPanel.Create(Self);
+  Q.Parent := TabTags;
+  Q.Align := alBottom;
+  Q.Height := 36 + 5 * 32;
+  Q.BevelOuter := bvNone;
+  Q.ParentColor := True;
   L := TLabel.Create(Self);
-  L.Parent := TabTags;
-  L.SetBounds(8, 68, 270, 18);
-  L.Caption := 'Tags in the tray (photos that have it):';
+  L.Parent := Q;
+  L.SetBounds(8, 10, 200, 18);
+  L.Caption := 'Quick Tags:';
+  R := TPanel.Create(Self);
+  R.Parent := Q;
+  R.Align := alTop;
+  R.Height := 32;
+  R.BevelOuter := bvNone;
+  R.ParentColor := True;
+  L.Parent := R;
+  L.Align := alClient;
+  L.Layout := tlCenter;
+  L.BorderSpacing.Left := 8;
+  BtnQuickCfg := TSpeedButton.Create(Self);
+  BtnQuickCfg.Parent := R;
+  BtnQuickCfg.Width := 32;
+  BtnQuickCfg.Align := alRight;
+  BtnQuickCfg.BorderSpacing.Right := 8;
+  BtnQuickCfg.Flat := True;
+  BtnQuickCfg.Hint := 'Configure the Quick Tags';
+  BtnQuickCfg.ShowHint := True;
+  PzSetGlyph(BtnQuickCfg, 'gear');
+  BtnQuickCfg.OnClick := @QuickCfgClick;
+  for k := 0 to 9 do
+  begin
+    QuickBtns[k] := TSpeedButton.Create(Self);
+    QuickBtns[k].Parent := Q;
+    QuickBtns[k].SetBounds(8 + (k mod 2) * 140, 36 + (k div 2) * 32, 136, 28);
+    QuickBtns[k].Tag := k;
+    QuickBtns[k].ShowHint := True;
+    QuickBtns[k].OnClick := @QuickTagClick;
+  end;
+
+  P := TPanel.Create(Self);
+  P.Parent := TabTags;
+  P.Align := alBottom;
+  P.Height := 36;
+  P.BevelOuter := bvNone;
+  P.ParentColor := True;
+  BtnRemoveTag := AddButton(P, 'Remove', 8, 4, 110, @RemoveTagClick, 'cancel');
+  BtnRemoveTag.Hint := 'Remove the chosen tag from the photos in the tray (Delete)';
+
   LstTags := TListBox.Create(Self);
   LstTags.Parent := TabTags;
-  LstTags.SetBounds(8, 90, 276, 300);
-  LstTags.Anchors := [akLeft, akTop, akRight, akBottom];
-  BtnRemoveTag := AddButton(TabTags, 'Remove tag', 8, 398, 140,
-    @RemoveTagClick, 'cancel');
-  BtnRemoveTag.Anchors := [akLeft, akBottom];
-  BtnRemoveTag.Hint := 'Remove the chosen tag from every photo in the tray';
+  LstTags.Align := alClient;
+  LstTags.BorderSpacing.Left := 8;
+  LstTags.BorderSpacing.Right := 8;
+  LstTags.OnKeyDown := @LstTagsKeyDown;
+
+  FQuickTags.StrictDelimiter := True;
+  FQuickTags.Delimiter := ';';
+  FQuickTags.DelimitedText := Settings.ReadString('tags', 'quick', '');
+  while FQuickTags.Count < 10 do
+    FQuickTags.Add('');
+  RefreshQuickTags;
+  RightPages.OnChange := @RightPagesChange;
 end;
 
 { the tray holds the pinned photos and the selection; in the editor it is
@@ -2203,6 +2404,8 @@ begin
       with TPzPhoto(L[i]) do
         if ISO > 0 then Add(FormatFloat('0', ISO));
     Field('ISO');
+    for i := 0 to NTop - 1 do Add(TPzPhoto(L[i]).Caption);
+    Field('Caption');
     for i := 0 to NTop - 1 do
       Add(StringReplace(TPzPhoto(L[i]).Keywords, ',', ', ', [rfReplaceAll]));
     Field('Tags');
@@ -2298,6 +2501,13 @@ begin
     LstTags.Items.EndUpdate;
     BtnAddTag.Enabled := L.Count > 0;
     BtnRemoveTag.Enabled := (L.Count > 0) and (FTagNames.Count > 0);
+    if L.Count = 0 then
+      LblTagsIn.Caption := 'No photo selected'
+    else if L.Count = 1 then
+      LblTagsIn.Caption := 'Tags in ' + TPzPhoto(L[0]).Name + ':'
+    else
+      LblTagsIn.Caption := Format('Tags in %d photos:', [L.Count]);
+    RefreshQuickTags;
   finally
     L.Free;
   end;
@@ -2475,8 +2685,7 @@ procedure TMainForm.TTagClick(Sender: TObject);
 begin
   PnlRight.Visible := True;
   RightPages.ActivePage := TabTags;
-  BtnShowTags.Down := True;
-  BtnEditInfo.Down := True;
+  SyncPanelButtons;
   SelectionChanged;
   EdTag.SetFocus;
 end;
@@ -2487,20 +2696,31 @@ var
 begin
   B := TSpeedButton(Sender);
   PnlRight.Visible := B.Down;
-  if B = BtnEditInfo then
-  begin
-    BtnShowProps.Down := B.Down;
-    if not B.Down then
-      BtnShowTags.Down := False;
-  end
-  else
-    BtnEditInfo.Down := B.Down;
-  if B = BtnShowTags then
+  if (B = BtnShowTags) or (B = BtnEditTags) then
     RightPages.ActivePage := TabTags
   else
     RightPages.ActivePage := TabProps;
+  SyncPanelButtons;
   if PnlRight.Visible then
     SelectionChanged;
+end;
+
+{ the four toggles (library bar and editor top bar) show one state }
+procedure TMainForm.SyncPanelButtons;
+var
+  V, T: Boolean;
+begin
+  V := PnlRight.Visible;
+  T := RightPages.ActivePage = TabTags;
+  BtnShowProps.Down := V and not T;
+  BtnEditInfo.Down := V and not T;
+  BtnShowTags.Down := V and T;
+  BtnEditTags.Down := V and T;
+end;
+
+procedure TMainForm.RightPagesChange(Sender: TObject);
+begin
+  SyncPanelButtons;
 end;
 
 procedure TMainForm.TrayPick(Sender: TObject; P: TPzPhoto);
@@ -2509,6 +2729,259 @@ begin
     Grid.EnsureVisible(P);
 end;
 
+{ ---------------- Picasa's edit-view tiles, caption, histogram, quick tags ---------------- }
+
+function TMainForm.AddTile(AParent: TWinControl; const ACaption, AIcon, AHint: string;
+  X, Y: Integer; H: TNotifyEvent): TSpeedButton;
+var
+  Bmp: TBitmap;
+begin
+  Result := TSpeedButton.Create(Self);
+  Result.Parent := AParent;
+  Result.SetBounds(X, Y, 80, 72);
+  Result.Caption := ACaption;
+  Result.Layout := blGlyphTop;
+  Result.Spacing := 4;
+  Result.Flat := True;
+  Result.Font.Height := -11;
+  Result.Font.Color := clPzHeader;
+  Result.Hint := AHint;
+  Result.ShowHint := True;
+  Result.OnClick := H;
+  Bmp := PzIconBitmap(AIcon, 2 * PzIconSize - 8);
+  if Bmp <> nil then
+    try
+      Result.Glyph.Assign(Bmp);
+    finally
+      Bmp.Free;
+    end;
+end;
+
+procedure TMainForm.StraightenClick(Sender: TObject);
+begin
+  { the slider and a levelling grid only while straightening }
+  if BtnStraighten.Down then
+    PnlStraighten.Top := 157; // right under the tiles, above Fill Light
+  PnlStraighten.Visible := BtnStraighten.Down;
+  Viewer.ShowGrid := BtnStraighten.Down;
+  if BtnStraighten.Down and (Viewer.Mode = vmCrop) then
+    CropCancelClick(nil);
+end;
+
+procedure TMainForm.SaveCaption;
+begin
+  if (Cur = nil) or (EdCaption.Text = Cur.Caption) then
+    Exit;
+  Cur.Folder.EnsureIni;
+  Cur.Caption := EdCaption.Text;
+  EditsChanged(Cur);
+end;
+
+procedure TMainForm.CaptionKeyPress(Sender: TObject; var Key: Char);
+begin
+  if Key = #13 then
+  begin
+    SaveCaption;
+    Viewer.SetFocus;
+    Key := #0;
+  end
+  else if Key = #27 then
+  begin
+    if Cur <> nil then
+      EdCaption.Text := Cur.Caption;
+    Viewer.SetFocus;
+    Key := #0;
+  end;
+end;
+
+procedure TMainForm.CaptionExit(Sender: TObject);
+begin
+  SaveCaption;
+end;
+
+procedure TMainForm.UpdateHistInfo;
+var
+  S: string;
+begin
+  Hist.Lines.Clear;
+  if Cur = nil then
+  begin
+    Hist.Invalidate;
+    Exit;
+  end;
+  if Cur.MetaState = 2 then
+  begin
+    Hist.Lines.Add(Trim(Cur.Make + '  ' + Cur.Model));
+    S := FmtExposure(Cur.Exposure);
+    if Cur.FNumber > 0 then
+      S := S + '   f/' + FormatFloat('0.0', Cur.FNumber);
+    if Cur.ISO > 0 then
+      S := S + '   ISO ' + FormatFloat('0', Cur.ISO);
+    Hist.Lines.Add(Trim(S));
+    if Cur.Focal > 0 then
+      Hist.Lines.Add('Focal length: ' + FormatFloat('0.#', Cur.Focal) + ' mm');
+    if Cur.Lens <> '' then
+      Hist.Lines.Add(Cur.Lens);
+  end
+  else
+    Hist.Lines.Add(Cur.Camera);
+  Hist.Lines.Add(Format('%d x %d pixels   %.1f MB', [Cur.W, Cur.H, Cur.Size / 1048576]));
+  Hist.Invalidate;
+end;
+
+procedure TMainForm.RefreshQuickTags;
+var
+  k, i, n: Integer;
+  L: TList;
+  T: TStringList;
+  All: Boolean;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    for k := 0 to 9 do
+    begin
+      if FQuickTags[k] = '' then
+      begin
+        QuickBtns[k].Caption := '?';
+        QuickBtns[k].Hint := 'Click to choose a tag for this button';
+        QuickBtns[k].Font.Style := [];
+        Continue;
+      end;
+      QuickBtns[k].Caption := FQuickTags[k];
+      { bold when every photo in the tray already has it }
+      All := L.Count > 0;
+      n := 0;
+      for i := 0 to L.Count - 1 do
+      begin
+        T := SplitTags(TPzPhoto(L[i]).Keywords);
+        T.CaseSensitive := False;
+        if T.IndexOf(FQuickTags[k]) >= 0 then
+          Inc(n)
+        else
+          All := False;
+        T.Free;
+      end;
+      if All then
+        QuickBtns[k].Font.Style := [fsBold]
+      else
+        QuickBtns[k].Font.Style := [];
+      QuickBtns[k].Hint := Format(
+        'Toggle "%s" on the photos in the tray (%d of %d have it)',
+        [FQuickTags[k], n, L.Count]);
+    end;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.SaveQuickTags;
+begin
+  FQuickTags.StrictDelimiter := True;
+  FQuickTags.Delimiter := ';';
+  Settings.WriteString('tags', 'quick', FQuickTags.DelimitedText);
+end;
+
+procedure TMainForm.QuickTagClick(Sender: TObject);
+var
+  k, i: Integer;
+  S: string;
+  L: TList;
+  T: TStringList;
+  All: Boolean;
+begin
+  k := TSpeedButton(Sender).Tag;
+  if FQuickTags[k] = '' then
+  begin
+    S := '';
+    if InputQuery('Quick Tag', 'Tag for this button:', S) and (Trim(S) <> '') then
+    begin
+      FQuickTags[k] := StringReplace(Trim(S), ',', ' ', [rfReplaceAll]);
+      SaveQuickTags;
+      RefreshQuickTags;
+    end;
+    Exit;
+  end;
+  { like Picasa: add the tag, or take it off when every photo has it }
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    All := L.Count > 0;
+    for i := 0 to L.Count - 1 do
+    begin
+      TPzPhoto(L[i]).Folder.EnsureIni;
+      T := SplitTags(TPzPhoto(L[i]).Keywords);
+      T.CaseSensitive := False;
+      All := All and (T.IndexOf(FQuickTags[k]) >= 0);
+      T.Free;
+    end;
+    if L.Count > 0 then
+      ApplyTag(FQuickTags[k], not All);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.QuickCfgClick(Sender: TObject);
+var
+  F: TForm;
+  M: TMemo;
+  B1, B2: TButton;
+  L: TLabel;
+  i: Integer;
+begin
+  F := TForm.CreateNew(nil);
+  try
+    F.Caption := 'Configure Quick Tags';
+    F.Width := 320;
+    F.Height := 340;
+    F.Position := poOwnerFormCenter;
+    L := TLabel.Create(F);
+    L.Parent := F;
+    L.SetBounds(10, 8, 300, 18);
+    L.Caption := 'One tag per line, up to ten:';
+    M := TMemo.Create(F);
+    M.Parent := F;
+    M.SetBounds(10, 30, 300, 250);
+    for i := 0 to 9 do
+      M.Lines.Add(FQuickTags[i]);
+    B1 := TButton.Create(F);
+    B1.Parent := F;
+    B1.SetBounds(130, 292, 84, 30);
+    B1.Caption := 'OK';
+    B1.ModalResult := mrOk;
+    B1.Default := True;
+    B2 := TButton.Create(F);
+    B2.Parent := F;
+    B2.SetBounds(222, 292, 84, 30);
+    B2.Caption := 'Cancel';
+    B2.ModalResult := mrCancel;
+    B2.Cancel := True;
+    if F.ShowModal = mrOk then
+    begin
+      for i := 0 to 9 do
+        if i < M.Lines.Count then
+          FQuickTags[i] := StringReplace(Trim(M.Lines[i]), ',', ' ', [rfReplaceAll])
+        else
+          FQuickTags[i] := '';
+      SaveQuickTags;
+      RefreshQuickTags;
+    end;
+  finally
+    F.Free;
+  end;
+end;
+
+procedure TMainForm.LstTagsKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
+begin
+  if Key = VK_DELETE then
+  begin
+    RemoveTagClick(nil);
+    Key := 0;
+  end;
+end;
+
 {$I pzbench.inc}
+
 
 end.

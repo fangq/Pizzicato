@@ -448,6 +448,42 @@ def _(c):
             dot(c, 36 + k * 28, 70 + r * 24, 7)
 
 
+@icon("straighten")  # a tilted photo over a level line
+def _(c):
+    c.save()
+    c.translate(64, 58)
+    c.rotate(-0.22)
+    photo(c, -46, -34, 92, 68, sun=ORANGE)
+    c.restore()
+    bar(c, 8, 108, 120, 108, ORANGE, W)
+    dot(c, 64, 108, 9, GOLD)
+
+
+@icon("plus")  # add: a round green plus
+def _(c):
+    badge(c, "plus", 64, 64, 54)
+
+
+@icon("gear")  # settings
+def _(c):
+    c.save()
+    c.translate(64, 64)
+    for i in range(8):
+        c.save()
+        c.rotate(i * math.pi / 4)
+        rrect(c, -11, -58, 22, 26, 6)
+        c.set_source(grad(ORANGE, -40, -60, 40, 60))
+        c.fill()
+        c.restore()
+    c.arc(0, 0, 40, 0, 2 * math.pi)
+    c.set_source(grad(ORANGE, -40, -40, 40, 40))
+    c.fill()
+    c.arc(0, 0, 16, 0, 2 * math.pi)
+    c.set_source_rgb(1, 1, 1)
+    c.fill()
+    c.restore()
+
+
 @icon("undoall")  # the painted undo with a red cross badge
 def _(c):
     painted(c, "undo")

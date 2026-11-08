@@ -118,6 +118,8 @@ type
     FOnPick: TPzPickEvent;
     FOnNav: TNotifyEvent;
     FInfo: string;
+    FShowGrid: Boolean;
+    procedure SetShowGrid(AValue: Boolean);
     function ImageRect: TRect;
     function ToImage(X, Y: Integer): TPoint;
   protected
@@ -134,6 +136,7 @@ type
     procedure SetMode(M: TPzViewMode);
     function CropRectNorm(out L, T, R, B: Double): Boolean;
     property Zoom100: Boolean read FZoom100 write FZoom100;
+    property ShowGrid: Boolean read FShowGrid write SetShowGrid;
     property Mode: TPzViewMode read FMode;
     property CropAspect: Double read FCropAspect write FCropAspect;
     property OnPick: TPzPickEvent read FOnPick write FOnPick;
@@ -164,6 +167,23 @@ type
     property Lib: TPzLibrary read FLib write FLib;
     property ThumbSize: Integer read FThumbSize write FThumbSize;
     property OnPick: TPzPhotoEvent read FOnPick write FOnPick;
+  end;
+
+  { TPzHistogram: Picasa's "Histogram & Camera Information" box }
+
+  TPzHistogram = class(TCustomControl)
+  private
+    FHist: Tpz_hist;
+    FHave: Boolean;
+    FLines: TStringList;
+  protected
+    procedure Paint; override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+    procedure SetHistogram(const H: Tpz_hist);
+    procedure Clear;
+    property Lines: TStringList read FLines;
   end;
 
   { TPzTray: Picasa's photo tray -- the held photos and the selection }
@@ -342,7 +362,8 @@ begin
       F.EnsureIni;
       for k := 0 to F.Count - 1 do
         F.Photo(k).FilterHit :=
-          Pos(Low, LowerCase(F.Photo(k).Name + ' ' + F.Photo(k).Keywords)) > 0;
+          Pos(Low, LowerCase(F.Photo(k).Name + ' ' + F.Photo(k).Keywords +
+          ' ' + F.Photo(k).Caption)) > 0;
     end;
     if FStarOnly then
       F.EnsureIni;
@@ -1050,6 +1071,12 @@ begin
   Invalidate;
 end;
 
+procedure TPzViewer.SetShowGrid(AValue: Boolean);
+begin
+  FShowGrid := AValue;
+  Invalidate;
+end;
+
 function TPzViewer.ImageRect: TRect;
 var
   B: TBitmap;
@@ -1101,6 +1128,7 @@ var
   R, CR: TRect;
   B: TBitmap;
   sx, sy: Double;
+  gi: Integer;
 begin
   C := Canvas;
   C.Brush.Color := Color;
@@ -1115,6 +1143,19 @@ begin
       C.Draw(R.Left, R.Top, B)
     else
       C.StretchDraw(R, B);
+    if FShowGrid then
+    begin
+      { a fine levelling grid while straightening, as Picasa shows }
+      C.Pen.Color := TColor($C8C8C8);
+      C.Pen.Style := psDot;
+      sx := (R.Right - R.Left) / 12;
+      sy := (R.Bottom - R.Top) / 8;
+      for gi := 1 to 11 do
+        C.Line(R.Left + Round(gi * sx), R.Top, R.Left + Round(gi * sx), R.Bottom);
+      for gi := 1 to 7 do
+        C.Line(R.Left, R.Top + Round(gi * sy), R.Right, R.Top + Round(gi * sy));
+      C.Pen.Style := psSolid;
+    end;
     if (FMode = vmCrop) and FHasCrop and (FBmp <> nil) then
     begin
       sx := (R.Right - R.Left) / FBmp.Width;
@@ -1447,6 +1488,92 @@ begin
     Max(0, FPhotos.Count * (ItemW + 4) - ClientWidth));
   Invalidate;
   Result := True;
+end;
+
+{ TPzHistogram }
+
+constructor TPzHistogram.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FLines := TStringList.Create;
+  Color := TColor($262626);
+  DoubleBuffered := True;
+end;
+
+destructor TPzHistogram.Destroy;
+begin
+  FLines.Free;
+  inherited Destroy;
+end;
+
+procedure TPzHistogram.SetHistogram(const H: Tpz_hist);
+begin
+  FHist := H;
+  FHave := True;
+  Invalidate;
+end;
+
+procedure TPzHistogram.Clear;
+begin
+  FHave := False;
+  FLines.Clear;
+  Invalidate;
+end;
+
+procedure TPzHistogram.Paint;
+const
+  Cols: array[0..2] of TColor = (TColor($F07850), TColor($50C850), TColor($5050F0));
+  // B, G, R
+var
+  C: TCanvas;
+  R: TRect;
+  i, ch, x, h, mx, Y: Integer;
+  Pts: array[0..257] of TPoint;
+begin
+  C := Canvas;
+  C.Brush.Color := Color;
+  C.FillRect(ClientRect);
+  C.Font.Height := -12;
+  C.Font.Style := [fsBold];
+  C.Font.Color := clPzHeader;
+  C.Brush.Style := bsClear;
+  C.TextOut(8, 4, 'Histogram & Camera Information');
+  C.Font.Style := [];
+  R := Rect(8, 24, ClientWidth - 8, 24 + 64);
+  C.Pen.Color := TColor($444444);
+  C.Brush.Style := bsClear;
+  C.Rectangle(R);
+  if FHave then
+  begin
+    mx := 1;
+    for ch := 0 to 2 do
+      for i := 2 to 253 do // ignore clipped ends when scaling
+        mx := Max(mx, FHist[ch][i]);
+    for ch := 2 downto 0 do
+    begin
+      for i := 0 to 255 do
+      begin
+        x := R.Left + 1 + i * (R.Right - R.Left - 2) div 255;
+        h := Min(R.Bottom - R.Top - 2, Round(FHist[ch][i] / mx *
+          (R.Bottom - R.Top - 2)));
+        Pts[i] := Point(x, R.Bottom - 1 - h);
+      end;
+      Pts[256] := Point(R.Right - 1, R.Bottom - 1);
+      Pts[257] := Point(R.Left + 1, R.Bottom - 1);
+      C.Pen.Color := Cols[ch];
+      C.Brush.Style := bsClear;
+      C.Polyline(Pts, 0, 256);
+    end;
+  end;
+  C.Font.Color := TColor($C8C8C8);
+  C.Font.Height := -11;
+  Y := R.Bottom + 6;
+  for i := 0 to FLines.Count - 1 do
+  begin
+    C.TextOut(8, Y, FLines[i]);
+    Inc(Y, 15);
+  end;
+  C.Brush.Style := bsSolid;
 end;
 
 end.

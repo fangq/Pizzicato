@@ -61,6 +61,7 @@ type
     FilterHit: Boolean;  // matches the search text
     { tags: Picasa's comma-separated keywords= }
     Keywords: string;
+    Caption: string;     // Picasa's caption=
     { EXIF details for the properties panel, read on demand }
     MetaState: Integer;  // 0 = not read, 1 = pending, 2 = read
     Make, Model, Lens: string;
@@ -437,6 +438,7 @@ begin
     P.Redo := Ini.ReadValue(P.Name, 'redo');
     P.Rotate := ParseRotate(Ini.ReadValue(P.Name, 'rotate'));
     P.Keywords := Ini.ReadValue(P.Name, 'keywords');
+    P.Caption := Ini.ReadValue(P.Name, 'caption');
   end;
 end;
 
@@ -451,6 +453,7 @@ begin
   Ini.WriteValue(P.Name, 'redo', P.Redo);
   Ini.WriteValue(P.Name, 'rotate', RotateToString(P.Rotate));
   Ini.WriteValue(P.Name, 'keywords', P.Keywords);
+  Ini.WriteValue(P.Name, 'caption', P.Caption);
 end;
 
 procedure TPzFolder.FlushIni;
