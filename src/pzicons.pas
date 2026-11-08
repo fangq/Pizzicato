@@ -51,8 +51,8 @@ begin
       if (Best < 0) or ((PZ_ICON_INDEX[i].Size >= ASize) and
         ((PZ_ICON_INDEX[Best].Size < ASize) or
         (PZ_ICON_INDEX[i].Size < PZ_ICON_INDEX[Best].Size))) or
-        ((PZ_ICON_INDEX[Best].Size < ASize) and (PZ_ICON_INDEX[i].Size >
-        PZ_ICON_INDEX[Best].Size)) then
+        ((PZ_ICON_INDEX[Best].Size < ASize) and
+        (PZ_ICON_INDEX[i].Size > PZ_ICON_INDEX[Best].Size)) then
         Best := i;
     end;
   if Best < 0 then

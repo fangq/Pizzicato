@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Pizzicato's toolbar icons, drawn in the style of LED's painted set
-(LED tools/visual_icons.py): thick rounded strokes in a cyan-to-violet
-gradient over a pale translucent fill, accents in green/red/orange/yellow.
+"""Pizzicato's toolbar icons. Where LED's painted artwork has a matching
+action (data/icons/painted, from LED's data/icons) the PNG is scaled in;
+the photo-specific icons are drawn here in the same style (LED's
+tools/visual_icons.py): thick rounded strokes in a cyan-to-violet gradient
+over a pale translucent fill, accents in green/red/orange/yellow.
 
     python3 tools/make_icons.py            # data/icons/*.png + src/pzicons.inc
     python3 tools/make_icons.py --sheet sheet.png
@@ -175,14 +177,6 @@ def curved_arrow(c, cx, cy, r, a0, a1, stops=BLUE, width=W):
     head(c, x, y, tang, stops, width, 20)
 
 
-def magnifier(c, cx=52, cy=52, r=32, stops=BLUE):
-    c.arc(cx, cy, r, 0, 2 * math.pi)
-    pale(c, stops)
-    stroke(c, stops)
-    d = r / math.sqrt(2)
-    bar(c, cx + d + 4, cy + d + 4, 112, 112, stops, W * 1.6)
-
-
 # ---------- the icons ----------
 
 ICONS = {}
@@ -195,32 +189,8 @@ def icon(name):
     return reg
 
 
-@icon("addfolder")
-def _(c):
-    rrect(c, 12, 34, 104, 70, 12)
-    pale(c)
-    stroke(c)
-    rrect(c, 12, 22, 44, 24, 10)
-    pale(c)
-    stroke(c)
-    badge(c, "plus", 96, 94, 26)
 
 
-@icon("search")
-def _(c):
-    magnifier(c)
-
-
-@icon("library")
-def _(c):
-    for (x, y) in ((14, 14), (70, 14), (14, 70), (70, 70)):
-        body(c, x, y, 44, 44, 10)
-
-
-@icon("thumbsize")
-def _(c):
-    body(c, 10, 62, 40, 40, 8)
-    body(c, 60, 26, 60, 76, 12)
 
 
 @icon("star")
@@ -243,50 +213,9 @@ def _(c):
     curved_arrow(c, 76, 50, 34, -0.85 * math.pi, -0.05 * math.pi, GREEN)
 
 
-@icon("zoom100")
-def _(c):
-    magnifier(c, 54, 54, 40)
-    text(c, "1:1", 54, 54, 30)
 
 
-@icon("export")
-def _(c):
-    photo(c, 10, 34, 84, 74)
-    c.move_to(70, 58)
-    c.line_to(112, 16)
-    stroke(c, GREEN, W * 1.1)
-    head(c, 112, 16, -math.pi / 4, GREEN, W * 1.1, 26)
 
-
-@icon("undo")
-def _(c):
-    c.move_to(30, 52)
-    c.line_to(80, 52)
-    c.arc(80, 78, 26, -math.pi / 2, math.pi / 2)
-    c.line_to(44, 104)
-    stroke(c, BLUE, W * 1.1)
-    head(c, 28, 52, math.pi, BLUE, W * 1.1, 24)
-
-
-@icon("redo")
-def _(c):
-    c.move_to(98, 52)
-    c.line_to(48, 52)
-    c.arc_negative(48, 78, 26, -math.pi / 2, math.pi / 2)
-    c.line_to(84, 104)
-    stroke(c, BLUE, W * 1.1)
-    head(c, 100, 52, 0, BLUE, W * 1.1, 24)
-
-
-@icon("undoall")
-def _(c):
-    c.move_to(30, 44)
-    c.line_to(72, 44)
-    c.arc(72, 68, 24, -math.pi / 2, math.pi / 2)
-    c.line_to(40, 92)
-    stroke(c, BLUE, W * 1.1)
-    head(c, 28, 44, math.pi, BLUE, W * 1.1, 22)
-    badge(c, "cross", 98, 98, 24)
 
 
 @icon("crop")
@@ -340,15 +269,6 @@ def _(c):
     c.arc(64, 64, 50, 0, 2 * math.pi)
     stroke(c)
 
-
-@icon("autocolor")  # three overlapping colour discs
-def _(c):
-    c.set_operator(cairo.OPERATOR_MULTIPLY)
-    for (x, y, col) in ((64, 44, (1.0, 0.33, 0.40)), (44, 80, (0.15, 0.85, 0.45)), (84, 80, (0.20, 0.50, 1.0))):
-        c.arc(x, y, 34, 0, 2 * math.pi)
-        c.set_source_rgba(*col, 0.85)
-        c.fill()
-    c.set_operator(cairo.OPERATOR_OVER)
 
 
 @icon("picker")  # neutral colour picker: an eyedropper
@@ -423,6 +343,42 @@ def _(c):
     star_path(c, 104, 100, 14, 0.32)
     c.set_source(grad(GOLD, 90, 86, 118, 114))
     c.fill()
+
+
+# painted artwork: icon name -> data/icons/painted/<file>.png
+PAINTED = {
+    "addfolder": "newfolder",
+    "search": "find",
+    "undo": "undo",
+    "redo": "redo",
+    "export": "saveas",
+    "library": "shading",
+    "zoom100": "zoomin",
+    "autocolor": "theme",
+    "thumbsize": "insertpicture",
+}
+PAINTED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "data", "icons", "painted")
+
+
+def painted(c, fname):
+    img = cairo.ImageSurface.create_from_png(os.path.join(PAINTED_DIR, fname + ".png"))
+    c.save()
+    c.scale(S / img.get_width(), S / img.get_height())
+    c.set_source_surface(img, 0, 0)
+    c.get_source().set_filter(cairo.FILTER_BEST)
+    c.paint()
+    c.restore()
+
+
+for _n, _f in PAINTED.items():
+    ICONS[_n] = (lambda f: lambda c: painted(c, f))(_f)
+
+
+@icon("undoall")  # the painted undo with a red cross badge
+def _(c):
+    painted(c, "undo")
+    badge(c, "cross", 98, 98, 26)
 
 
 # ---------- output ----------
