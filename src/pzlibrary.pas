@@ -55,6 +55,16 @@ type
     Index: Integer;      // index inside folder
     Failed: Boolean;
     ViewPending: Boolean;
+    { selection (main thread) }
+    Selected: Boolean;   // in the grid's selection
+    Held: Boolean;       // pinned in the photo tray
+    FilterHit: Boolean;  // matches the search text
+    { tags: Picasa's comma-separated keywords= }
+    Keywords: string;
+    { EXIF details for the properties panel, read on demand }
+    MetaState: Integer;  // 0 = not read, 1 = pending, 2 = read
+    Make, Model, Lens: string;
+    Exposure, FNumber, ISO, Focal: Single;
     destructor Destroy; override;
     function Path: string;
     function EditKey: string;
@@ -76,6 +86,7 @@ type
     { layout, owned by the grid }
     Top, Height: Integer;
     Visible: Boolean;
+    FilterAll: Boolean;  // the folder itself matches the search
     constructor Create;
     destructor Destroy; override;
     function Photo(i: Integer): TPzPhoto; inline;
@@ -85,7 +96,7 @@ type
     procedure FlushIni;
   end;
 
-  TPzJobKind = (jkThumb, jkGen, jkView);
+  TPzJobKind = (jkThumb, jkGen, jkView, jkProbe);
 
   TPzJob = class
     Kind: TPzJobKind;
@@ -178,7 +189,7 @@ type
     FPending: array of TPendingThumb;
     FQLock: TCriticalSection;
     FQEvent: TEvent;
-    FViewQ, FThumbQ, FGenQ: TList;
+    FViewQ, FThumbQ, FGenQ, FProbeQ: TList;
     FResults: TList;
     FDeliverQueued: Boolean;
     FWorkers: array of TPzWorker;
@@ -212,6 +223,7 @@ type
     procedure Shutdown;
     procedure SortFolders;
     procedure RequestThumb(P: TPzPhoto; ASize: Integer);
+    procedure RequestProbe(P: TPzPhoto);
     procedure RequestView(P: TPzPhoto; MaxW, MaxH, Flags, Token: Integer;
       Front: Boolean);
     procedure QueueBackgroundGen;
@@ -233,6 +245,8 @@ function PzCPUCount: Integer;
 function FormatFromExt(const Name: string): Integer;
 function FolderDateFromName(const Name: string; Fallback: Int64): Int64;
 function FormatTaken(T: Int64): string;
+function SplitTags(const S: string): TStringList;
+function JoinTags(L: TStrings): string;
 
 implementation
 
@@ -316,6 +330,35 @@ begin
   end;
 end;
 
+function SplitTags(const S: string): TStringList;
+var
+  i: Integer;
+begin
+  Result := TStringList.Create;
+  Result.StrictDelimiter := True;
+  Result.Delimiter := ',';
+  Result.DelimitedText := S;
+  for i := Result.Count - 1 downto 0 do
+  begin
+    Result[i] := Trim(Result[i]);
+    if Result[i] = '' then
+      Result.Delete(i);
+  end;
+end;
+
+function JoinTags(L: TStrings): string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to L.Count - 1 do
+  begin
+    if i > 0 then
+      Result := Result + ',';
+    Result := Result + L[i];
+  end;
+end;
+
 function FormatTaken(T: Int64): string;
 begin
   if T <= 0 then
@@ -393,6 +436,7 @@ begin
     P.Filters := Ini.ReadValue(P.Name, 'filters');
     P.Redo := Ini.ReadValue(P.Name, 'redo');
     P.Rotate := ParseRotate(Ini.ReadValue(P.Name, 'rotate'));
+    P.Keywords := Ini.ReadValue(P.Name, 'keywords');
   end;
 end;
 
@@ -406,6 +450,7 @@ begin
   Ini.WriteValue(P.Name, 'filters', P.Filters);
   Ini.WriteValue(P.Name, 'redo', P.Redo);
   Ini.WriteValue(P.Name, 'rotate', RotateToString(P.Rotate));
+  Ini.WriteValue(P.Name, 'keywords', P.Keywords);
 end;
 
 procedure TPzFolder.FlushIni;
@@ -477,7 +522,13 @@ begin
   R.Token := J.Token;
   PzInit(R.Img);
   try
-    if J.Kind = jkView then
+    if J.Kind = jkProbe then
+    begin
+      rc := pz_probe(PAnsiChar(J.Path), @R.Meta);
+      R.OK := rc >= 0;
+      R.HaveMeta := R.OK;
+    end
+    else if J.Kind = jkView then
     begin
       rc := pz_load(PAnsiChar(J.Path), J.MaxW, J.MaxH, J.Flags, @R.Img, @R.Meta);
       R.OK := rc >= 0;
@@ -707,6 +758,7 @@ begin
   FQLock := TCriticalSection.Create;
   FQEvent := TEvent.Create(nil, False, False, '');
   FViewQ := TList.Create;
+  FProbeQ := TList.Create;
   FThumbQ := TList.Create;
   FGenQ := TList.Create;
   FResults := TList.Create;
@@ -740,11 +792,13 @@ begin
   Folders.Free;
   FFolderById.Free;
   for i := 0 to FViewQ.Count - 1 do TPzJob(FViewQ[i]).Free;
+  for i := 0 to FProbeQ.Count - 1 do TPzJob(FProbeQ[i]).Free;
   for i := 0 to FThumbQ.Count - 1 do TPzJob(FThumbQ[i]).Free;
   for i := 0 to FGenQ.Count - 1 do TPzJob(FGenQ[i]).Free;
   for i := 0 to FResults.Count - 1 do TPzResult(FResults[i]).Free;
   for i := 0 to FScanResults.Count - 1 do TPzScanDir(FScanResults[i]).Free;
   FViewQ.Free;
+  FProbeQ.Free;
   FThumbQ.Free;
   FGenQ.Free;
   FResults.Free;
@@ -976,6 +1030,13 @@ begin
       FViewQ.Delete(0);
       Exit(True);
     end;
+    { EXIF for the properties panel: header reads, cheap }
+    if FProbeQ.Count > 0 then
+    begin
+      J := TPzJob(FProbeQ[0]);
+      FProbeQ.Delete(0);
+      Exit(True);
+    end;
     { visible thumbnails, newest request first; drop ones scrolled away }
     while FThumbQ.Count > 0 do
     begin
@@ -1035,8 +1096,18 @@ begin
       end;
       if R.HaveMeta and (R.Photo <> nil) then
       begin
-        if R.Kind <> jkView then
+        if R.Kind in [jkThumb, jkGen] then
           R.Photo.HasThumb := True;
+        if R.Kind = jkProbe then
+        begin
+          R.Photo.Make := Trim(StrPas(PAnsiChar(@R.Meta.make[0])));
+          R.Photo.Model := Trim(StrPas(PAnsiChar(@R.Meta.model[0])));
+          R.Photo.Lens := Trim(StrPas(PAnsiChar(@R.Meta.lens[0])));
+          R.Photo.Exposure := R.Meta.exposure;
+          R.Photo.FNumber := R.Meta.fnumber;
+          R.Photo.ISO := R.Meta.iso;
+          R.Photo.Focal := R.Meta.focal;
+        end;
         if (R.Meta.width > 0) and ((R.Kind <> jkView) or (R.Flags and PZ_THUMB = 0)) then
         begin
           R.Photo.W := R.Meta.width;
@@ -1052,8 +1123,10 @@ begin
         Inc(GenDone);
       if R.Kind = jkThumb then
         R.Photo.BmpPending := False;
-      if R.Photo <> nil then
+      if (R.Photo <> nil) and (R.Kind in [jkThumb, jkGen]) then
         R.Photo.Failed := not R.OK;
+      if (R.Photo <> nil) and (R.Kind = jkProbe) then
+        R.Photo.MetaState := 2;
       if Assigned(FOnResult) then
         FOnResult(R) // handler may steal R.Img
       ;
@@ -1259,6 +1332,24 @@ begin
   FQEvent.SetEvent;
 end;
 
+procedure TPzLibrary.RequestProbe(P: TPzPhoto);
+var
+  J: TPzJob;
+begin
+  if P.MetaState <> 0 then
+    Exit;
+  P.MetaState := 1;
+  J := TPzJob.Create;
+  J.Kind := jkProbe;
+  J.Photo := P;
+  J.Path := P.Path;
+  J.PhotoId := P.Id;
+  FQLock.Enter;
+  FProbeQ.Add(J);
+  FQLock.Leave;
+  FQEvent.SetEvent;
+end;
+
 procedure TPzLibrary.RequestView(P: TPzPhoto; MaxW, MaxH, Flags, Token: Integer;
   Front: Boolean);
 var
@@ -1343,7 +1434,7 @@ end;
 function TPzLibrary.PendingJobs: Integer;
 begin
   FQLock.Enter;
-  Result := FViewQ.Count + FThumbQ.Count + FGenQ.Count;
+  Result := FViewQ.Count + FThumbQ.Count + FGenQ.Count + FProbeQ.Count;
   FQLock.Leave;
 end;
 

@@ -9,7 +9,7 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
-  LCLType, LCLIntf, IniFiles, Math, Menus, DateUtils,
+  LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils,
   Buttons, ImgList,
   pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons;
 
@@ -41,6 +41,25 @@ type
     ImgSearch, ImgSize: TImage;
     TabIcons: TImageList;
     FEffNames: TStringList;  // filter name of each effect button, by Tag
+    { photo tray (bottom bar), as in Picasa }
+    PnlBottom, PnlSummary, PnlBotRight: TPanel;
+    LblSummary: TLabel;
+    Tray: TPzTray;
+    BtnPin, BtnClearSel: TSpeedButton;
+    BtnTStar, BtnTRotL, BtnTRotR, BtnTTag, BtnTExport: TBitBtn;
+    BtnShowProps, BtnShowTags, BtnEditInfo: TSpeedButton;
+    { properties and tags (right panel) }
+    PnlRight: TPanel;
+    RightPages: TPageControl;
+    TabProps, TabTags: TTabSheet;
+    LstProps: TListBox;
+    EdTag: TEdit;
+    BtnAddTag, BtnRemoveTag: TBitBtn;
+    LstTags: TListBox;
+    FTagNames: TStringList;
+    TreeIcons: TImageList;
+    Held: TList;             // photos pinned in the tray
+    FPropsQueued: Boolean;
     ChkRawPreview: TCheckBox;
     TrkSize: TTrackBar;
     LblStatus: TLabel;
@@ -88,6 +107,28 @@ type
     procedure TryOpenFile;
     procedure BuildUI;
     procedure BuildEditPanel;
+    procedure BuildBottomBar;
+    procedure BuildRightPanel;
+    procedure TrayPhotos(L: TList);
+    procedure SelectionChanged;
+    procedure UpdateProps;
+    procedure QueueProps;
+    procedure DoQueuedProps(Data: PtrInt);
+    procedure UpdateTags;
+    procedure ApplyTag(const ATag: string; AAdd: Boolean);
+    procedure PinClick(Sender: TObject);
+    procedure ClearSelClick(Sender: TObject);
+    procedure TStarClick(Sender: TObject);
+    procedure TRotLClick(Sender: TObject);
+    procedure TRotRClick(Sender: TObject);
+    procedure TTagClick(Sender: TObject);
+    procedure ShowPanelClick(Sender: TObject);
+    procedure AddTagClick(Sender: TObject);
+    procedure RemoveTagClick(Sender: TObject);
+    procedure EdTagKeyPress(Sender: TObject; var Key: Char);
+    procedure TrayPick(Sender: TObject; P: TPzPhoto);
+    procedure PropsDrawItem(Control: TWinControl; Index: Integer;
+      ARect: TRect; State: TOwnerDrawState);
     function AddSlider(AParent: TWinControl; const ACaption: string;
       AMin, AMax: Integer; K: TSliderKind; var Y: Integer): TTrackBar;
     function AddButton(AParent: TWinControl; const ACaption: string;
@@ -205,6 +246,8 @@ var
 begin
   inherited CreateNew(TheOwner);
   Cache := TList.Create;
+  Held := TList.Create;
+  FTagNames := TStringList.Create;
   FDirtyFolders := TList.Create;
   CfgDir := GetEnvironmentVariable('HOME') + '/.config/pizzicato';
   ForceDirectories(CfgDir);
@@ -299,6 +342,8 @@ begin
   Cache.Free;
   FDirtyFolders.Free;
   FEffNames.Free;
+  Held.Free;
+  FTagNames.Free;
   Settings.Free;
   if FBenchLogOpen then
     CloseFile(FBenchLog);
@@ -310,6 +355,17 @@ begin
   OnShow := nil;
   RebuildTree;
   Grid.Relayout;
+  { the properties/tags panel as it was left }
+  case Settings.ReadInteger('view', 'rightpanel', 0) of
+    1: BtnShowProps.Down := True;
+    2: BtnShowTags.Down := True;
+  end;
+  PnlRight.Visible := BtnShowProps.Down or BtnShowTags.Down;
+  if BtnShowTags.Down then
+    RightPages.ActivePage := TabTags
+  else
+    RightPages.ActivePage := TabProps;
+  SelectionChanged;
   if FGenAll then
     Application.QueueAsyncCall(@RunGenAllAsync, 0)
   else if FBench then
@@ -349,7 +405,7 @@ begin
   EdSearch := TEdit.Create(Self);
   EdSearch.Parent := PnlTop;
   EdSearch.SetBounds(168, 7, 220, 26);
-  EdSearch.TextHint := 'Search folders';
+  EdSearch.TextHint := 'Search folders, tags, file names';
   EdSearch.OnChange := @SearchChange;
   ChkStar := TSpeedButton.Create(Self);
   ChkStar.Parent := PnlTop;
@@ -403,6 +459,12 @@ begin
   Tree.OnChange := @TreeChange;
   Tree.TabStop := False;
   Tree.Options := Tree.Options + [tvoRowSelect] - [tvoShowRoot];
+  TreeIcons := TImageList.Create(Self);
+  TreeIcons.Width := Max(16, PzIconSize - 4);
+  TreeIcons.Height := TreeIcons.Width;
+  PzAddToImageList(TreeIcons, 'calendar'); // 0: a year
+  PzAddToImageList(TreeIcons, 'folder');   // 1: an album
+  Tree.Images := TreeIcons;
 
   Splitter := TSplitter.Create(Self);
   Splitter.Parent := PnlLibrary;
@@ -416,6 +478,7 @@ begin
   Grid.OnOpen := @GridOpen;
   Grid.OnSelect := @GridSelect;
   Grid.OnTopFolder := @GridTopFolder;
+  Grid.SetFolderIcon(PzIconBitmap('folder', 2 * PzIconSize - 8));
 
   { ---- edit mode ---- }
   PnlEdit := TPanel.Create(Self);
@@ -424,6 +487,8 @@ begin
   PnlEdit.BevelOuter := bvNone;
   PnlEdit.Visible := False;
   BuildEditPanel;
+  BuildBottomBar;
+  BuildRightPanel;
 
   TmrIni := TTimer.Create(Self);
   TmrIni.Enabled := False;
@@ -670,7 +735,12 @@ begin
       if R.OK then
         CachePut(R);
     end;
+    jkProbe:
+      if PnlRight.Visible then
+        QueueProps;
   end;
+  if (R.Kind = jkThumb) and (Tray.Photos.IndexOf(R.Photo) >= 0) then
+    Tray.Invalidate;
 end;
 
 procedure TMainForm.LibScanDir(Sender: TObject);
@@ -732,10 +802,13 @@ begin
       if Year <> LastYear then
       begin
         YNode := Tree.Items.Add(nil, Year);
+        YNode.ImageIndex := 0;
+        YNode.SelectedIndex := 0;
         LastYear := Year;
       end;
       N := Tree.Items.AddChildObject(YNode, F.Name + '  (' + IntToStr(F.Count) + ')', F);
-      if N = nil then;
+      N.ImageIndex := 1;
+      N.SelectedIndex := 1;
     end;
     if Tree.Items.Count > 0 then
       Tree.Items[0].Expand(False);
@@ -784,7 +857,7 @@ end;
 
 procedure TMainForm.GridSelect(Sender: TObject; P: TPzPhoto);
 begin
-  UpdateStatus;
+  SelectionChanged;
 end;
 
 procedure TMainForm.StripPick(Sender: TObject; P: TPzPhoto);
@@ -845,6 +918,12 @@ begin
   PnlEdit.Visible := AOn;
   PnlLibrary.Visible := not AOn;
   PnlTop.Visible := not AOn;
+  { the properties/tags panel follows into the editor }
+  if AOn then
+    PnlRight.Parent := PnlEdit
+  else
+    PnlRight.Parent := PnlLibrary;
+  BtnEditInfo.Down := PnlRight.Visible;
   if AOn then
     Viewer.SetFocus
   else
@@ -858,6 +937,7 @@ begin
     Grid.SetFocus;
     Grid.Invalidate;
   end;
+  SelectionChanged;
 end;
 
 function TMainForm.RawFlags: Integer;
@@ -1023,6 +1103,8 @@ begin
   if N <> nil then
     RequestViews(Grid.NextPhoto(N, 1), False);
   UpdateStatus;
+  if PnlRight.Visible then
+    SelectionChanged;
 end;
 
 procedure TMainForm.Navigate(Delta: Integer);
@@ -1589,7 +1671,7 @@ begin
     if FEditMode then
       L.Add(Cur)
     else
-      Grid.SelectionList(L);
+      TrayPhotos(L);
     if L.Count > 0 then
       ExportPhotos(L, Dir);
   finally
@@ -1609,12 +1691,15 @@ begin
     P := Cur
   else
     P := Grid.Selected;
+  { star, rotate and tag act on the whole tray, as Picasa's buttons do }
   if (ssCtrl in Shift) and (Key = VK_8) then
-    ToggleStar(P)
+    TStarClick(nil)
   else if (ssCtrl in Shift) and (Key = VK_OEM_6) then // ]
-    RotatePhoto(P, 1)
+    TRotRClick(nil)
   else if (ssCtrl in Shift) and (Key = VK_OEM_4) then // [
-    RotatePhoto(P, -1)
+    TRotLClick(nil)
+  else if (ssCtrl in Shift) and (Key = VK_T) then
+    TTagClick(nil)
   else if FEditMode then
   begin
     if (ssCtrl in Shift) and (Key = VK_Z) then UndoClick(nil)
@@ -1681,9 +1766,747 @@ begin
   Settings.WriteInteger('window', 'tree', Tree.Width);
   Settings.WriteInteger('view', 'thumbsize', TrkSize.Position);
   Settings.WriteBool('view', 'rawpreview', ChkRawPreview.Checked);
+  if not PnlRight.Visible then
+    Settings.WriteInteger('view', 'rightpanel', 0)
+  else if RightPages.ActivePage = TabTags then
+    Settings.WriteInteger('view', 'rightpanel', 2)
+  else
+    Settings.WriteInteger('view', 'rightpanel', 1);
   Lib.Shutdown;
   Lib.Free;
   Lib := nil;
+end;
+
+{ ---------------- photo tray, properties and tags ---------------- }
+
+procedure TMainForm.BuildBottomBar;
+var
+  X: Integer;
+
+  function TB(const ACap, AIcon, AHint: string; AW: Integer; H: TNotifyEvent): TBitBtn;
+  begin
+    Result := AddButton(PnlBottom, ACap, X, 30, AW, H, AIcon);
+    Result.Height := 32;
+    Result.Hint := AHint;
+    Inc(X, AW + 6);
+  end;
+
+  function Toggle(AParent: TWinControl; const AIcon, AHint: string;
+    AX, AGroup: Integer): TSpeedButton;
+  begin
+    Result := TSpeedButton.Create(Self);
+    Result.Parent := AParent;
+    Result.SetBounds(AX, 30, 40, 32);
+    Result.Hint := AHint;
+    Result.ShowHint := True;
+    if AGroup > 0 then
+    begin
+      Result.GroupIndex := AGroup;
+      Result.AllowAllUp := True;
+    end;
+    PzSetGlyph(Result, AIcon);
+  end;
+
+begin
+  PnlBottom := TPanel.Create(Self);
+  PnlBottom.Parent := PnlLibrary;
+  PnlBottom.Align := alBottom;
+  PnlBottom.Height := 112;
+  PnlBottom.BevelOuter := bvNone;
+  PnlBottom.Color := TColor($2C2C2C);
+  PnlBottom.ShowHint := True;
+
+  { Picasa's blue strip: what the tray holds }
+  PnlSummary := TPanel.Create(Self);
+  PnlSummary.Parent := PnlBottom;
+  PnlSummary.Align := alTop;
+  PnlSummary.Height := 22;
+  PnlSummary.BevelOuter := bvNone;
+  PnlSummary.Color := TColor($B0782E);
+  LblSummary := TLabel.Create(Self);
+  LblSummary.Parent := PnlSummary;
+  LblSummary.Align := alClient;
+  LblSummary.Alignment := taCenter;
+  LblSummary.Layout := tlCenter;
+  LblSummary.Font.Color := clWhite;
+  LblSummary.Font.Style := [fsBold];
+
+  PnlBotRight := TPanel.Create(Self);
+  PnlBotRight.Parent := PnlBottom;
+  PnlBotRight.Align := alRight;
+  PnlBotRight.Width := 330;
+  PnlBotRight.BevelOuter := bvNone;
+  PnlBotRight.ParentColor := True;
+  { the thumbnail size slider lives here, as in Picasa }
+  ImgSize.Parent := PnlBotRight;
+  ImgSize.SetBounds(6, 14, PzIconSize, PzIconSize);
+  TrkSize.Parent := PnlBotRight;
+  TrkSize.SetBounds(32, 8, 180, 32);
+  BtnShowProps := Toggle(PnlBotRight, 'info', 'Properties of the selection', 228, 2);
+  BtnShowProps.OnClick := @ShowPanelClick;
+  BtnShowTags := Toggle(PnlBotRight, 'tag', 'Tags of the selection (Ctrl+T)', 274, 2);
+  BtnShowTags.OnClick := @ShowPanelClick;
+  BtnShowProps.Top := 8;
+  BtnShowTags.Top := 8;
+
+  Tray := TPzTray.Create(Self);
+  Tray.Parent := PnlBottom;
+  Tray.SetBounds(6, 26, 340, 82);
+  Tray.Lib := Lib;
+  Tray.OnPick := @TrayPick;
+
+  BtnPin := Toggle(PnlBottom, 'pin',
+    'Hold: keep the selected photos in the tray', 352, 0);
+  BtnPin.SetBounds(352, 28, 34, 38);
+  BtnPin.OnClick := @PinClick;
+  BtnClearSel := Toggle(PnlBottom, 'clearsel',
+    'Clear the tray and the selection', 352, 0);
+  BtnClearSel.SetBounds(352, 70, 34, 38);
+  BtnClearSel.OnClick := @ClearSelClick;
+
+  X := 398;
+  BtnTStar := TB('Star', 'star', 'Star or unstar the photos in the tray (Ctrl+8)',
+    84, @TStarClick);
+  BtnTRotL := TB('', 'rotleft', 'Rotate counter-clockwise (Ctrl+[)', 36, @TRotLClick);
+  BtnTRotR := TB('', 'rotright', 'Rotate clockwise (Ctrl+])', 36, @TRotRClick);
+  BtnTTag := TB('Tag', 'tag', 'Add a tag to the photos in the tray (Ctrl+T)',
+    80, @TTagClick);
+  BtnTExport := TB('Export…', 'export', 'Save edited copies of the photos in the tray',
+    104, @ExportClick);
+
+  { the edit view gets its own properties toggle }
+  BtnEditInfo := Toggle(PnlEditTop, 'info', 'Properties', 0, 3);
+  BtnEditInfo.SetBounds(472, 4, 38, 32);
+  BtnEditInfo.OnClick := @ShowPanelClick;
+  LblName.Left := 520;
+end;
+
+procedure TMainForm.BuildRightPanel;
+var
+  L: TLabel;
+begin
+  PnlRight := TPanel.Create(Self);
+  PnlRight.Parent := PnlLibrary;
+  PnlRight.Align := alRight;
+  PnlRight.Width := 300;
+  PnlRight.BevelOuter := bvNone;
+  PnlRight.Visible := False;
+  PnlRight.ShowHint := True;
+
+  RightPages := TPageControl.Create(Self);
+  RightPages.Parent := PnlRight;
+  RightPages.Align := alClient;
+  RightPages.Images := TabIcons;
+  RightPages.TabStop := False;
+
+  TabProps := RightPages.AddTabSheet;
+  TabProps.Caption := 'Properties';
+  TabProps.ImageIndex := PzAddToImageList(TabIcons, 'info');
+  LstProps := TListBox.Create(Self);
+  LstProps.Parent := TabProps;
+  LstProps.Align := alClient;
+  LstProps.Style := lbOwnerDrawFixed;
+  LstProps.ItemHeight := 38;
+  LstProps.Color := TColor($2A2A2A);
+  LstProps.OnDrawItem := @PropsDrawItem;
+  LstProps.TabStop := False;
+
+  TabTags := RightPages.AddTabSheet;
+  TabTags.Caption := 'Tags';
+  TabTags.ImageIndex := PzAddToImageList(TabIcons, 'tag');
+  L := TLabel.Create(Self);
+  L.Parent := TabTags;
+  L.SetBounds(8, 8, 270, 18);
+  L.Caption := 'Add tags to the photos in the tray:';
+  EdTag := TEdit.Create(Self);
+  EdTag.Parent := TabTags;
+  EdTag.SetBounds(8, 30, 190, 28);
+  EdTag.TextHint := 'tag1, tag2…';
+  EdTag.OnKeyPress := @EdTagKeyPress;
+  BtnAddTag := AddButton(TabTags, 'Add', 204, 30, 80, @AddTagClick, 'tag');
+  L := TLabel.Create(Self);
+  L.Parent := TabTags;
+  L.SetBounds(8, 68, 270, 18);
+  L.Caption := 'Tags in the tray (photos that have it):';
+  LstTags := TListBox.Create(Self);
+  LstTags.Parent := TabTags;
+  LstTags.SetBounds(8, 90, 276, 300);
+  LstTags.Anchors := [akLeft, akTop, akRight, akBottom];
+  BtnRemoveTag := AddButton(TabTags, 'Remove tag', 8, 398, 140,
+    @RemoveTagClick, 'cancel');
+  BtnRemoveTag.Anchors := [akLeft, akBottom];
+  BtnRemoveTag.Hint := 'Remove the chosen tag from every photo in the tray';
+end;
+
+{ the tray holds the pinned photos and the selection; in the editor it is
+  the photo being edited }
+procedure TMainForm.TrayPhotos(L: TList);
+var
+  i: Integer;
+  Sel: TList;
+begin
+  L.Clear;
+  if FEditMode then
+  begin
+    if Cur <> nil then
+      L.Add(Cur);
+    Exit;
+  end;
+  for i := 0 to Held.Count - 1 do
+    L.Add(Held[i]);
+  Sel := TList.Create;
+  try
+    Grid.SelectionList(Sel);
+    for i := 0 to Sel.Count - 1 do
+      if not TPzPhoto(Sel[i]).Held then
+        L.Add(Sel[i]);
+  finally
+    Sel.Free;
+  end;
+end;
+
+procedure TMainForm.SelectionChanged;
+var
+  L: TList;
+  i: Integer;
+  Bytes: Int64;
+  T0, T1: Int64;
+  P: TPzPhoto;
+  Dates: string;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    if not FEditMode then
+      Tray.SetPhotos(L);
+    Bytes := 0;
+    T0 := High(Int64);
+    T1 := 0;
+    for i := 0 to L.Count - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      Inc(Bytes, P.Size);
+      if P.Taken > 0 then
+      begin
+        T0 := Min(T0, P.Taken);
+        T1 := Max(T1, P.Taken);
+      end;
+      if PnlRight.Visible and (i < 400) then
+        Lib.RequestProbe(P); // EXIF for the properties list, in the background
+    end;
+    Dates := '';
+    if T1 > 0 then
+    begin
+      Dates := FormatDateTime('mmm d, yyyy', UnixToDateTimeSafe(T0));
+      if FormatDateTime('yyyymmdd', UnixToDateTimeSafe(T0)) <>
+        FormatDateTime('yyyymmdd', UnixToDateTimeSafe(T1)) then
+        Dates := Dates + ' – ' + FormatDateTime('mmm d, yyyy', UnixToDateTimeSafe(T1));
+    end;
+    if L.Count = 0 then
+      LblSummary.Caption :=
+        'No selection — click, Ctrl+click or Shift+click photos; Hold keeps them here'
+    else
+      LblSummary.Caption := Format('%d picture%s     %s     %.1f MB on disk%s',
+        [L.Count, IfThen(L.Count = 1, '', 's'), Dates, Bytes / 1048576,
+        IfThen(Held.Count > 0, Format('     (%d held)', [Held.Count]), '')]);
+  finally
+    L.Free;
+  end;
+  if PnlRight.Visible then
+  begin
+    UpdateProps;
+    UpdateTags;
+  end;
+  UpdateStatus;
+end;
+
+procedure TMainForm.QueueProps;
+begin
+  if FPropsQueued then
+    Exit;
+  FPropsQueued := True;
+  Application.QueueAsyncCall(@DoQueuedProps, 0);
+end;
+
+procedure TMainForm.DoQueuedProps(Data: PtrInt);
+begin
+  FPropsQueued := False;
+  UpdateProps;
+end;
+
+function FmtExposure(e: Single): string;
+begin
+  if e <= 0 then
+    Result := ''
+  else if e < 0.5 then
+    Result := Format('1/%d s', [Round(1 / e)])
+  else
+    Result := FormatFloat('0.#', e) + ' s';
+end;
+
+procedure TMainForm.UpdateProps;
+var
+  L: TList;
+  N, Pending, i, j, NTop: Integer;
+  P: TPzPhoto;
+  Bytes: Int64;
+  Vals: TStringList;
+  Chain: TPzChain;
+  E: string;
+
+  { the most common value and, for several photos, how many share it }
+  procedure Field(const AName: string);
+  var
+    k, best: Integer;
+    V: string;
+  begin
+    best := -1;
+    for k := 0 to Vals.Count - 1 do
+      if (Vals[k] <> '') and ((best < 0) or (PtrInt(Vals.Objects[k]) >
+        PtrInt(Vals.Objects[best]))) then
+        best := k;
+    if best >= 0 then
+    begin
+      V := Vals[best];
+      if N > 1 then
+        V := V + Format('   (%d)', [PtrInt(Vals.Objects[best])]);
+      LstProps.Items.Add(AName + #9 + V);
+    end;
+    Vals.Clear;
+  end;
+
+  { one date, or the earliest and latest of several }
+  procedure DateRange(const AName: string; AFile: Boolean);
+  var
+    k, cnt: Integer;
+    T, A, B: Int64;
+  begin
+    A := High(Int64);
+    B := 0;
+    cnt := 0;
+    for k := 0 to NTop - 1 do
+    begin
+      if AFile then
+        T := TPzPhoto(L[k]).MTime
+      else
+        T := TPzPhoto(L[k]).Taken;
+      if T <= 0 then
+        Continue;
+      Inc(cnt);
+      A := Min(A, T);
+      B := Max(B, T);
+    end;
+    if cnt = 0 then
+      Exit;
+    if A = B then
+      LstProps.Items.Add(AName + #9 + FormatTaken(A))
+    else
+      LstProps.Items.Add(AName + #9 + FormatDateTime('yyyy-mm-dd hh:nn',
+        UnixToDateTimeSafe(A)) + ' – ' + FormatDateTime('yyyy-mm-dd hh:nn',
+        UnixToDateTimeSafe(B)));
+  end;
+
+  procedure Add(const V: string);
+  var
+    k: Integer;
+  begin
+    if V = '' then
+      Exit;
+    k := Vals.IndexOf(V);
+    if k < 0 then
+      Vals.AddObject(V, TObject(PtrInt(1)))
+    else
+      Vals.Objects[k] := TObject(PtrInt(Vals.Objects[k]) + 1);
+  end;
+
+begin
+  if not PnlRight.Visible then
+    Exit;
+  L := TList.Create;
+  Vals := TStringList.Create;
+  Vals.CaseSensitive := True;
+  LstProps.Items.BeginUpdate;
+  try
+    LstProps.Items.Clear;
+    TrayPhotos(L);
+    N := L.Count;
+    if N = 0 then
+    begin
+      LstProps.Items.Add('Properties' + #9 + 'nothing selected');
+      Exit;
+    end;
+    NTop := Min(N, 2000);
+    Pending := 0;
+    Bytes := 0;
+    for i := 0 to N - 1 do
+      Inc(Bytes, TPzPhoto(L[i]).Size);
+    if N > 1 then
+      LstProps.Items.Add('Selection' + #9 + Format('%d photos, %.1f MB',
+        [N, Bytes / 1048576]))
+    else
+    begin
+      P := TPzPhoto(L[0]);
+      LstProps.Items.Add('File name' + #9 + P.Name);
+      LstProps.Items.Add('File size' + #9 + Format('%.1f MB  (%d bytes)',
+        [P.Size / 1048576, P.Size]));
+    end;
+    for i := 0 to NTop - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      P.Folder.EnsureIni;
+      if P.MetaState <> 2 then
+        Inc(Pending);
+    end;
+    for i := 0 to NTop - 1 do Add(TPzPhoto(L[i]).Folder.Path);
+    Field('Location');
+    for i := 0 to NTop - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      E := UpperCase(Copy(ExtractFileExt(P.Name), 2, 10));
+      if P.IsRaw then
+        E := E + ' (camera raw)';
+      Add(E);
+    end;
+    Field('Format');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if W > 0 then
+          Add(Format('%d x %d pixels  (%.1f MP)', [W, H, W * H / 1e6]));
+    Field('Dimensions');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if MetaState = 2 then Add(Make)
+        else
+          Add('');
+    Field('Camera make');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if MetaState = 2 then Add(Model)
+        else
+          Add(Camera);
+    Field('Camera model');
+    for i := 0 to NTop - 1 do Add(TPzPhoto(L[i]).Lens);
+    Field('Lens');
+    DateRange('Camera date', False);
+    DateRange('File date (UTC)', True);
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if Focal > 0 then Add(FormatFloat('0.#', Focal) + ' mm');
+    Field('Focal length');
+    for i := 0 to NTop - 1 do Add(FmtExposure(TPzPhoto(L[i]).Exposure));
+    Field('Exposure time');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if FNumber > 0 then Add('f/' + FormatFloat('0.0', FNumber));
+    Field('F number');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        if ISO > 0 then Add(FormatFloat('0', ISO));
+    Field('ISO');
+    for i := 0 to NTop - 1 do
+      Add(StringReplace(TPzPhoto(L[i]).Keywords, ',', ', ', [rfReplaceAll]));
+    Field('Tags');
+    for i := 0 to NTop - 1 do Add(IfThen(TPzPhoto(L[i]).Star, 'Yes', 'No'));
+    Field('Starred');
+    for i := 0 to NTop - 1 do
+    begin
+      Chain := ParseChain(TPzPhoto(L[i]).Filters);
+      E := '';
+      for j := 0 to High(Chain) do
+        E := E + IfThen(E = '', '', ', ') + Chain[j].Name;
+      Add(IfThen(E = '', 'none', E));
+    end;
+    Field('Edits (filters)');
+    for i := 0 to NTop - 1 do
+      with TPzPhoto(L[i]) do
+        Add(IfThen(Rotate = 0, 'none', IntToStr(Rotate * 90) + '° clockwise'));
+    Field('Rotation');
+    if Pending > 0 then
+      LstProps.Items.Add('EXIF' + #9 + Format('reading %d of %d photos…',
+        [Pending, NTop]));
+  finally
+    LstProps.Items.EndUpdate;
+    Vals.Free;
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.PropsDrawItem(Control: TWinControl; Index: Integer;
+  ARect: TRect; State: TOwnerDrawState);
+var
+  C: TCanvas;
+  S, AName, AVal: string;
+  k: Integer;
+begin
+  C := LstProps.Canvas;
+  S := LstProps.Items[Index];
+  k := Pos(#9, S);
+  AName := Copy(S, 1, k - 1);
+  AVal := Copy(S, k + 1, MaxInt);
+  C.Brush.Color := TColor($2A2A2A);
+  C.FillRect(ARect);
+  C.Pen.Color := TColor($3A3A3A);
+  C.Line(ARect.Left + 6, ARect.Bottom - 1, ARect.Right - 6, ARect.Bottom - 1);
+  C.Brush.Style := bsClear;
+  C.Font.Height := -11;
+  C.Font.Style := [fsBold];
+  C.Font.Color := TColor($9A9A9A);
+  C.TextOut(ARect.Left + 8, ARect.Top + 3, AName);
+  C.Font.Style := [];
+  C.Font.Height := -13;
+  C.Font.Color := TColor($E6E6E6);
+  C.TextRect(Rect(ARect.Left + 14, ARect.Top + 18, ARect.Right - 4, ARect.Bottom - 2),
+    ARect.Left + 14, ARect.Top + 18, AVal);
+  C.Brush.Style := bsSolid;
+end;
+
+procedure TMainForm.UpdateTags;
+var
+  L: TList;
+  i, k, j: Integer;
+  T: TStringList;
+begin
+  if not PnlRight.Visible then
+    Exit;
+  L := TList.Create;
+  FTagNames.Clear;
+  FTagNames.CaseSensitive := False;
+  try
+    TrayPhotos(L);
+    for i := 0 to L.Count - 1 do
+    begin
+      TPzPhoto(L[i]).Folder.EnsureIni;
+      T := SplitTags(TPzPhoto(L[i]).Keywords);
+      try
+        for k := 0 to T.Count - 1 do
+        begin
+          j := FTagNames.IndexOf(T[k]);
+          if j < 0 then
+            FTagNames.AddObject(T[k], TObject(PtrInt(1)))
+          else
+            FTagNames.Objects[j] := TObject(PtrInt(FTagNames.Objects[j]) + 1);
+        end;
+      finally
+        T.Free;
+      end;
+    end;
+    LstTags.Items.BeginUpdate;
+    LstTags.Items.Clear;
+    for i := 0 to FTagNames.Count - 1 do
+      LstTags.Items.Add(Format('%s     (%d of %d)',
+        [FTagNames[i], PtrInt(FTagNames.Objects[i]), L.Count]));
+    LstTags.Items.EndUpdate;
+    BtnAddTag.Enabled := L.Count > 0;
+    BtnRemoveTag.Enabled := (L.Count > 0) and (FTagNames.Count > 0);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.ApplyTag(const ATag: string; AAdd: Boolean);
+var
+  L: TList;
+  i, k: Integer;
+  T: TStringList;
+  P: TPzPhoto;
+  Chg: Boolean;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    for i := 0 to L.Count - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      P.Folder.EnsureIni;
+      T := SplitTags(P.Keywords);
+      T.CaseSensitive := False;
+      try
+        k := T.IndexOf(ATag);
+        Chg := False;
+        if AAdd and (k < 0) then
+        begin
+          T.Add(ATag);
+          Chg := True;
+        end
+        else if not AAdd and (k >= 0) then
+        begin
+          T.Delete(k);
+          Chg := True;
+        end;
+        if Chg then
+        begin
+          P.Keywords := JoinTags(T);
+          EditsChanged(P);
+        end;
+      finally
+        T.Free;
+      end;
+    end;
+  finally
+    L.Free;
+  end;
+  UpdateTags;
+  UpdateProps;
+end;
+
+procedure TMainForm.AddTagClick(Sender: TObject);
+var
+  T: TStringList;
+  i: Integer;
+begin
+  T := SplitTags(EdTag.Text);
+  try
+    for i := 0 to T.Count - 1 do
+      ApplyTag(T[i], True);
+  finally
+    T.Free;
+  end;
+  EdTag.Clear;
+end;
+
+procedure TMainForm.RemoveTagClick(Sender: TObject);
+begin
+  if (LstTags.ItemIndex >= 0) and (LstTags.ItemIndex < FTagNames.Count) then
+    ApplyTag(FTagNames[LstTags.ItemIndex], False);
+end;
+
+procedure TMainForm.EdTagKeyPress(Sender: TObject; var Key: Char);
+begin
+  if Key = #13 then
+  begin
+    AddTagClick(nil);
+    Key := #0;
+  end;
+end;
+
+procedure TMainForm.PinClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+begin
+  L := TList.Create;
+  try
+    Grid.SelectionList(L);
+    for i := 0 to L.Count - 1 do
+      if not TPzPhoto(L[i]).Held then
+      begin
+        TPzPhoto(L[i]).Held := True;
+        Held.Add(L[i]);
+      end;
+  finally
+    L.Free;
+  end;
+  SelectionChanged;
+end;
+
+procedure TMainForm.ClearSelClick(Sender: TObject);
+var
+  i: Integer;
+begin
+  for i := 0 to Held.Count - 1 do
+    TPzPhoto(Held[i]).Held := False;
+  Held.Clear;
+  Grid.ClearSelection;
+  SelectionChanged;
+end;
+
+procedure TMainForm.TStarClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+  All: Boolean;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    All := L.Count > 0;
+    for i := 0 to L.Count - 1 do
+    begin
+      TPzPhoto(L[i]).Folder.EnsureIni;
+      All := All and TPzPhoto(L[i]).Star;
+    end;
+    { like Picasa: star them all, or unstar if every one is starred }
+    for i := 0 to L.Count - 1 do
+      if TPzPhoto(L[i]).Star = All then
+        ToggleStar(TPzPhoto(L[i]));
+  finally
+    L.Free;
+  end;
+  Tray.Invalidate;
+  if PnlRight.Visible then
+    UpdateProps;
+end;
+
+procedure TMainForm.TRotLClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    for i := 0 to L.Count - 1 do
+      RotatePhoto(TPzPhoto(L[i]), -1);
+  finally
+    L.Free;
+  end;
+  if PnlRight.Visible then
+    UpdateProps;
+end;
+
+procedure TMainForm.TRotRClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+begin
+  L := TList.Create;
+  try
+    TrayPhotos(L);
+    for i := 0 to L.Count - 1 do
+      RotatePhoto(TPzPhoto(L[i]), 1);
+  finally
+    L.Free;
+  end;
+  if PnlRight.Visible then
+    UpdateProps;
+end;
+
+procedure TMainForm.TTagClick(Sender: TObject);
+begin
+  PnlRight.Visible := True;
+  RightPages.ActivePage := TabTags;
+  BtnShowTags.Down := True;
+  BtnEditInfo.Down := True;
+  SelectionChanged;
+  EdTag.SetFocus;
+end;
+
+procedure TMainForm.ShowPanelClick(Sender: TObject);
+var
+  B: TSpeedButton;
+begin
+  B := TSpeedButton(Sender);
+  PnlRight.Visible := B.Down;
+  if B = BtnEditInfo then
+  begin
+    BtnShowProps.Down := B.Down;
+    if not B.Down then
+      BtnShowTags.Down := False;
+  end
+  else
+    BtnEditInfo.Down := B.Down;
+  if B = BtnShowTags then
+    RightPages.ActivePage := TabTags
+  else
+    RightPages.ActivePage := TabProps;
+  if PnlRight.Visible then
+    SelectionChanged;
+end;
+
+procedure TMainForm.TrayPick(Sender: TObject; P: TPzPhoto);
+begin
+  if Grid.IsShown(P) and (P.Folder <> nil) and P.Folder.Visible then
+    Grid.EnsureVisible(P);
 end;
 
 {$I pzbench.inc}

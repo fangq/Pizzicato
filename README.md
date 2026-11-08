@@ -10,6 +10,14 @@ pixel kernels).
 * **Picasa-style library**: every folder in one continuous scroll with folder
   headers, a year/folder tree, a thumbnail size slider, stars, and a
   "Starred only" filter.
+* **Photo tray, as in Picasa**: the selection (click, Ctrl+click, Shift+click
+  across folders, Ctrl+A for a folder) plus photos *held* with the pin. Star,
+  rotate, tag and export act on everything in the tray. A blue strip sums it up
+  (count, dates, size on disk).
+* **Properties and tags** in a right-hand panel. The properties of the tray
+  are shown Picasa-style, with "(n)" counts and date ranges; EXIF is read in the
+  background. Tags are Picasa's `keywords=` in `.picasa.ini`, and the search box
+  matches folders, tags and file names.
 * **Fast thumbnail cache** in SQLite (WAL mode), with JPEG blobs of 320 px on
   the long edge. Writes are batched, and each worker thread has its own read
   connection.
@@ -57,7 +65,10 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 | Library | arrows, PgUp/PgDn, Home/End | move / scroll                  |
 | Library | Enter, double-click         | open in editor                 |
 | Library | Ctrl+wheel                  | thumbnail size                 |
-| Both    | Ctrl+8                      | toggle star                    |
+| Library | Ctrl+click, Shift+click     | add to / extend the selection  |
+| Library | Ctrl+A                      | select the folder              |
+| Both    | Ctrl+T                      | tag the photos in the tray     |
+| Both    | Ctrl+8                      | star / unstar the tray         |
 | Both    | Ctrl+] / Ctrl+[             | rotate clockwise / counter-clockwise |
 | Editor  | ←/→, PgUp/PgDn, Space       | previous / next photo          |
 | Editor  | Ctrl+Z / Ctrl+Y             | undo / redo                    |
@@ -68,7 +79,7 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 
 | `.picasa.ini` key / filter | Status |
 |---|---|
-| `star=yes`, `rotate=rotate(n)` | read + write |
+| `star=yes`, `rotate=rotate(n)`, `keywords=` (tags) | read + write |
 | `filters=` chain, `redo=` (undo stack) | read + write, unknown entries kept verbatim |
 | `fill`, `finetune2` (fill, highlights, shadows, neutral colour, temperature) | rendered |
 | `autolight`, `autocolor`, `enhance` | rendered |
@@ -101,4 +112,8 @@ the top of `src/pzrender.pas` and in `core/pzcore.c`.
 
     ./pizzicato --bench --log=bench.txt --db=/local/pz.db <root>   # never writes .picasa.ini
     ./pizzicato --gen-all --log=gen.txt --db=/local/pz.db <root>   # build every thumbnail
+
+Under Xvfb, run a window manager as well (for example `xfwm4 --compositor=off &`).
+Without one, GTK keeps polling X for frame extents that never arrive, and the
+window takes about 0.8 s longer to appear. On a real desktop this doesn't happen.
     core/pzbench thumb|view|raw|full|filters [-j N] files...

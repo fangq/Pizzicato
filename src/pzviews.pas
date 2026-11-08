@@ -23,6 +23,7 @@ const
 
 type
   TPzPhotoEvent = procedure(Sender: TObject; P: TPzPhoto) of object;
+  TPzSelMode = (smReplace, smToggle, smRange);
 
   { TPzGrid }
 
@@ -36,8 +37,10 @@ type
     FCols: Integer;
     FCell: Integer;
     FShown: TList;        // folders currently laid out
-    FSelected: TPzPhoto;
-    FSel: TList;          // multi selection
+    FSelected: TPzPhoto;  // focus
+    FAnchor: TPzPhoto;    // start of a shift-click range
+    FSel: TList;          // the selection, in click order
+    FFolderIcon: TBitmap;
     FStarOnly: Boolean;
     FFilter: string;
     FOnOpen: TPzPhotoEvent;
@@ -70,7 +73,11 @@ type
     function HitTest(X, Y: Integer): TPzPhoto;
     procedure ScrollToFolder(F: TPzFolder);
     procedure EnsureVisible(P: TPzPhoto);
-    procedure Select(P: TPzPhoto; AddToSel: Boolean = False);
+    procedure Select(P: TPzPhoto; Mode: TPzSelMode = smReplace);
+    procedure ClearSelection;
+    procedure SelectAllInFolder(F: TPzFolder);
+    function OrderKey(P: TPzPhoto): Int64;
+    procedure SetFolderIcon(B: TBitmap);
     procedure ThumbArrived(P: TPzPhoto; Bmp: TBitmap);
     function TopFolder: TPzFolder;
     function IsShown(P: TPzPhoto): Boolean;
@@ -159,6 +166,32 @@ type
     property OnPick: TPzPhotoEvent read FOnPick write FOnPick;
   end;
 
+  { TPzTray: Picasa's photo tray -- the held photos and the selection }
+
+  TPzTray = class(TCustomControl)
+  private
+    FPhotos: TList;   // not owned
+    FOffset: Integer;
+    FLib: TPzLibrary;
+    FThumbSize: Integer;
+    FOnPick: TPzPhotoEvent;
+    function ItemW: Integer;
+  protected
+    procedure Paint; override;
+    procedure MouseDown(Button: TMouseButton; Shift: TShiftState;
+      X, Y: Integer); override;
+    function DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+      MousePos: TPoint): Boolean; override;
+  public
+    constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
+    procedure SetPhotos(L: TList);
+    property Photos: TList read FPhotos;
+    property Lib: TPzLibrary read FLib write FLib;
+    property ThumbSize: Integer read FThumbSize write FThumbSize;
+    property OnPick: TPzPhotoEvent read FOnPick write FOnPick;
+  end;
+
 function ImageToBitmap(const Img: Tpz_image): TBitmap;
 procedure DrawStar(C: TCanvas; X, Y, R: Integer);
 
@@ -223,6 +256,7 @@ destructor TPzGrid.Destroy;
 begin
   FShown.Free;
   FSel.Free;
+  FFolderIcon.Free;
   inherited Destroy;
 end;
 
@@ -278,7 +312,8 @@ end;
 
 function TPzGrid.IsShown(P: TPzPhoto): Boolean;
 begin
-  Result := (P <> nil) and (not FStarOnly or P.Star);
+  Result := (P <> nil) and (not FStarOnly or P.Star) and
+    ((FFilter = '') or P.FilterHit or ((P.Folder <> nil) and P.Folder.FilterAll));
 end;
 
 procedure TPzGrid.Relayout;
@@ -299,14 +334,23 @@ begin
   begin
     F := TPzFolder(FLib.Folders[i]);
     F.Visible := False;
-    if (Low <> '') and (Pos(Low, LowerCase(F.Path)) = 0) then
-      Continue;
-    if FStarOnly then
+    { like Picasa's search: a matching folder shows all of it, otherwise
+      only the photos whose name or tags match }
+    F.FilterAll := (Low = '') or (Pos(Low, LowerCase(F.Path)) > 0);
+    if not F.FilterAll then
     begin
       F.EnsureIni;
+      for k := 0 to F.Count - 1 do
+        F.Photo(k).FilterHit :=
+          Pos(Low, LowerCase(F.Photo(k).Name + ' ' + F.Photo(k).Keywords)) > 0;
+    end;
+    if FStarOnly then
+      F.EnsureIni;
+    if FStarOnly or not F.FilterAll then
+    begin
       n := 0;
       for k := 0 to F.Count - 1 do
-        if F.Photo(k).Star then
+        if IsShown(F.Photo(k)) then
           Inc(n);
     end
     else
@@ -519,12 +563,19 @@ begin
         C.Font.Color := clPzHeader;
         Hdr := F.Name;
         C.Brush.Style := bsClear;
-        C.TextOut(CELL_PAD, F.Top - FScrollY + 10, Hdr);
+        j := CELL_PAD;
+        if FFolderIcon <> nil then
+        begin
+          C.Draw(CELL_PAD, F.Top - FScrollY + (HEADER_H - 4 - FFolderIcon.Height) div
+            2, FFolderIcon);
+          j := CELL_PAD + FFolderIcon.Width + 8;
+        end;
+        C.TextOut(j, F.Top - FScrollY + 10, Hdr);
         C.Font.Style := [];
         C.Font.Height := -12;
         C.Font.Color := clPzSub;
         Sub := Format('%d photos   %s', [F.Count, ExtractFileDir(F.Path)]);
-        C.TextOut(CELL_PAD + C.TextWidth(Hdr) * 15 div 12 + 24, F.Top -
+        C.TextOut(j + C.TextWidth(Hdr) * 15 div 12 + 24, F.Top -
           FScrollY + 13, Sub);
         C.Pen.Color := TColor($3A3A3A);
         C.Line(CELL_PAD, F.Top - FScrollY + HEADER_H - 4, ClientWidth -
@@ -538,7 +589,7 @@ begin
       for k := 0 to F.Count - 1 do
       begin
         P := F.Photo(k);
-        if FStarOnly and not P.Star then
+        if not IsShown(P) then
           Continue;
         Inc(idx);
         j := idx div FCols;
@@ -557,7 +608,7 @@ begin
         end;
         if (R.Bottom < 0) or (R.Top > ClientHeight) then
           Continue;
-        if (P = FSelected) or (FSel.IndexOf(P) >= 0) then
+        if P.Selected then
         begin
           C.Brush.Color := clPzSel;
           C.FillRect(Rect(R.Left - 4, R.Top - 4, R.Right + 4, R.Bottom + 4));
@@ -664,7 +715,7 @@ begin
       idx := r * FCols + c;
       for k := 0 to F.Count - 1 do
       begin
-        if FStarOnly and not F.Photo(k).Star then
+        if not IsShown(F.Photo(k)) then
           Continue;
         if idx = 0 then
           Exit(F.Photo(k));
@@ -675,24 +726,92 @@ begin
   end;
 end;
 
-procedure TPzGrid.Select(P: TPzPhoto; AddToSel: Boolean);
+function TPzGrid.OrderKey(P: TPzPhoto): Int64;
 begin
-  if AddToSel then
-  begin
-    if FSelected <> nil then
-      if FSel.IndexOf(FSelected) < 0 then
-        FSel.Add(FSelected);
-    if FSel.IndexOf(P) >= 0 then
-      FSel.Remove(P)
-    else
+  Result := Int64(FShown.IndexOf(P.Folder)) * 10000000 + P.Index;
+end;
+
+procedure TPzGrid.ClearSelection;
+var
+  i: Integer;
+begin
+  for i := 0 to FSel.Count - 1 do
+    TPzPhoto(FSel[i]).Selected := False;
+  FSel.Clear;
+  Invalidate;
+end;
+
+procedure TPzGrid.Select(P: TPzPhoto; Mode: TPzSelMode);
+var
+  A, B, Q: TPzPhoto;
+  guard: Integer;
+begin
+  if P = nil then
+    Exit;
+  case Mode of
+    smReplace:
+    begin
+      ClearSelection;
+      P.Selected := True;
       FSel.Add(P);
-  end
-  else
-    FSel.Clear;
+      FAnchor := P;
+    end;
+    smToggle:
+    begin
+      P.Selected := not P.Selected;
+      if P.Selected then
+        FSel.Add(P)
+      else
+        FSel.Remove(P);
+      FAnchor := P;
+    end;
+    smRange:
+    begin
+      if (FAnchor = nil) or not IsShown(FAnchor) then
+        FAnchor := P;
+      ClearSelection;
+      A := FAnchor;
+      B := P;
+      if OrderKey(A) > OrderKey(B) then
+      begin
+        A := P;
+        B := FAnchor;
+      end;
+      Q := A;
+      guard := 0;
+      while (Q <> nil) and (guard < 1000000) do
+      begin
+        Q.Selected := True;
+        FSel.Add(Q);
+        if Q = B then
+          Break;
+        Q := NextPhoto(Q, 1);
+        Inc(guard);
+      end;
+    end;
+  end;
   FSelected := P;
   Invalidate;
   if Assigned(FOnSelect) then
     FOnSelect(Self, P);
+end;
+
+procedure TPzGrid.SelectAllInFolder(F: TPzFolder);
+var
+  k: Integer;
+begin
+  if F = nil then
+    Exit;
+  ClearSelection;
+  for k := 0 to F.Count - 1 do
+    if IsShown(F.Photo(k)) then
+    begin
+      F.Photo(k).Selected := True;
+      FSel.Add(F.Photo(k));
+    end;
+  Invalidate;
+  if Assigned(FOnSelect) then
+    FOnSelect(Self, FSelected);
 end;
 
 procedure TPzGrid.SelectionList(L: TList);
@@ -702,8 +821,12 @@ begin
   L.Clear;
   for i := 0 to FSel.Count - 1 do
     L.Add(FSel[i]);
-  if (FSelected <> nil) and (L.IndexOf(FSelected) < 0) then
-    L.Add(FSelected);
+end;
+
+procedure TPzGrid.SetFolderIcon(B: TBitmap);
+begin
+  FFolderIcon.Free;
+  FFolderIcon := B;
 end;
 
 procedure TPzGrid.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
@@ -713,8 +836,14 @@ begin
   inherited MouseDown(Button, Shift, X, Y);
   SetFocus;
   P := HitTest(X, Y);
-  if P <> nil then
-    Select(P, ssCtrl in Shift);
+  if P = nil then
+    Exit;
+  if ssShift in Shift then
+    Select(P, smRange)
+  else if ssCtrl in Shift then
+    Select(P, smToggle)
+  else if not P.Selected or (Button = mbLeft) then
+    Select(P, smReplace);
 end;
 
 procedure TPzGrid.DblClick;
@@ -790,13 +919,27 @@ begin
     VK_RETURN:
       if (FSelected <> nil) and Assigned(FOnOpen) then
         FOnOpen(Self, FSelected);
+    VK_A:
+      if ssCtrl in Shift then
+      begin
+        if FSelected <> nil then
+          SelectAllInFolder(FSelected.Folder);
+      end
+      else
+      begin
+        inherited KeyDown(Key, Shift);
+        Exit;
+      end;
     else
       inherited KeyDown(Key, Shift);
       Exit;
   end;
   if N <> nil then
   begin
-    Select(N);
+    if ssShift in Shift then
+      Select(N, smRange)
+    else
+      Select(N);
     EnsureVisible(N);
   end;
   Key := 0;
@@ -822,7 +965,7 @@ begin
     for k := 0 to F.Count - 1 do
     begin
       P := F.Photo(k);
-      if FStarOnly and not P.Star then
+      if not IsShown(P) then
         Continue;
       Inc(idx);
       R := CellRect(F, idx);
@@ -1196,6 +1339,112 @@ begin
   if FFolder <> nil then
     FOffset := EnsureRange(FOffset - WheelDelta, 0,
       Max(0, FFolder.Count * (ItemW + 6) - ClientWidth));
+  Invalidate;
+  Result := True;
+end;
+
+{ TPzTray }
+
+constructor TPzTray.Create(AOwner: TComponent);
+begin
+  inherited Create(AOwner);
+  FPhotos := TList.Create;
+  Color := TColor($242424);
+  DoubleBuffered := True;
+  FThumbSize := 160;
+end;
+
+destructor TPzTray.Destroy;
+begin
+  FPhotos.Free;
+  inherited Destroy;
+end;
+
+function TPzTray.ItemW: Integer;
+begin
+  Result := ClientHeight - 10;
+end;
+
+procedure TPzTray.SetPhotos(L: TList);
+begin
+  FPhotos.Assign(L);
+  FOffset := EnsureRange(FOffset, 0, Max(0, FPhotos.Count * (ItemW + 4) - ClientWidth));
+  Invalidate;
+end;
+
+procedure TPzTray.Paint;
+var
+  C: TCanvas;
+  i, X, S: Integer;
+  P: TPzPhoto;
+  R, D: TRect;
+  sc: Double;
+begin
+  C := Canvas;
+  C.Brush.Color := Color;
+  C.FillRect(ClientRect);
+  S := ItemW;
+  if FPhotos.Count = 0 then
+  begin
+    C.Font.Color := TColor($707070);
+    C.Font.Height := -14;
+    C.Brush.Style := bsClear;
+    C.TextOut((ClientWidth - C.TextWidth('Selection')) div 2,
+      (ClientHeight - 16) div 2, 'Selection');
+    C.Brush.Style := bsSolid;
+    Exit;
+  end;
+  for i := Max(0, FOffset div (S + 4)) to FPhotos.Count - 1 do
+  begin
+    X := 5 + i * (S + 4) - FOffset;
+    if X > ClientWidth then
+      Break;
+    P := TPzPhoto(FPhotos[i]);
+    R := Rect(X, 5, X + S, 5 + S);
+    if P.Bmp <> nil then
+    begin
+      sc := Min(S / P.Bmp.Width, S / P.Bmp.Height);
+      D := Rect(0, 0, Round(P.Bmp.Width * sc), Round(P.Bmp.Height * sc));
+      OffsetRect(D, R.Left + (S - D.Right) div 2, R.Top + (S - D.Bottom) div 2);
+      C.StretchDraw(D, P.Bmp);
+    end
+    else
+    begin
+      C.Brush.Color := clPzCell;
+      C.FillRect(Rect(R.Left + 4, R.Top + 10, R.Right - 4, R.Bottom - 10));
+      if (FLib <> nil) and not P.Failed then
+      begin
+        P.WantEpoch := FLib.Epoch;
+        FLib.RequestThumb(P, FThumbSize);
+      end;
+    end;
+    if P.Held then
+    begin
+      { held: a green corner mark, like Picasa's pin }
+      C.Brush.Color := TColor($50C850);
+      C.Pen.Color := TColor($202020);
+      C.Ellipse(R.Right - 12, R.Top + 2, R.Right - 2, R.Top + 12);
+    end;
+    if P.Star then
+      DrawStar(C, R.Left + 8, R.Bottom - 8, 5);
+  end;
+end;
+
+procedure TPzTray.MouseDown(Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
+var
+  i: Integer;
+begin
+  inherited MouseDown(Button, Shift, X, Y);
+  i := (X - 5 + FOffset) div (ItemW + 4);
+  if (i >= 0) and (i < FPhotos.Count) and Assigned(FOnPick) then
+    FOnPick(Self, TPzPhoto(FPhotos[i]));
+end;
+
+function TPzTray.DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+  MousePos: TPoint): Boolean;
+begin
+  FOffset := EnsureRange(FOffset - WheelDelta, 0,
+    Max(0, FPhotos.Count * (ItemW + 4) - ClientWidth));
   Invalidate;
   Result := True;
 end;

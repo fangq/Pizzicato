@@ -356,6 +356,7 @@ PAINTED = {
     "zoom100": "zoomin",
     "autocolor": "theme",
     "thumbsize": "insertpicture",
+    "folder": "open",
 }
 PAINTED_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "data", "icons", "painted")
@@ -373,6 +374,78 @@ def painted(c, fname):
 
 for _n, _f in PAINTED.items():
     ICONS[_n] = (lambda f: lambda c: painted(c, f))(_f)
+
+
+@icon("pin")  # hold the selection in the tray: a green push pin
+def _(c):
+    c.save()
+    c.translate(64, 64)
+    c.rotate(math.pi / 5)
+    rrect(c, -22, -54, 44, 18, 8)
+    c.set_source(grad(GREEN, -22, -54, 22, -36))
+    c.fill()
+    c.move_to(-14, -36)
+    c.line_to(14, -36)
+    c.line_to(20, 4)
+    c.line_to(-20, 4)
+    c.close_path()
+    pale(c, GREEN)
+    stroke(c, GREEN)
+    rrect(c, -34, 0, 68, 14, 7)
+    c.set_source(grad(GREEN, -34, 0, 34, 14))
+    c.fill()
+    bar(c, 0, 16, 0, 58, GREY, W * 0.8)
+    c.restore()
+
+
+@icon("clearsel")  # clear the selection: Picasa's red ring
+def _(c):
+    c.arc(64, 64, 42, 0, 2 * math.pi)
+    stroke(c, RED, W * 1.5)
+
+
+@icon("tag")  # a luggage tag
+def _(c):
+    c.move_to(18, 24)
+    c.line_to(64, 24)
+    c.line_to(110, 70)
+    c.line_to(70, 110)
+    c.line_to(24, 64)
+    c.close_path()
+    pale(c, ORANGE)
+    stroke(c, ORANGE)
+    c.arc(44, 46, 9, 0, 2 * math.pi)
+    stroke(c, ORANGE, W * 0.8)
+    bar(c, 60, 64, 82, 86, ORANGE, W * 0.8)
+
+
+@icon("info")  # properties
+def _(c):
+    c.arc(64, 64, 52, 0, 2 * math.pi)
+    c.set_source(grad(BLUE))
+    c.fill()
+    dot(c, 64, 36, 9, [(0, (1, 1, 1)), (1, (1, 1, 1))])
+    c.set_source_rgb(1, 1, 1)
+    c.set_line_width(W * 1.4)
+    c.set_line_cap(cairo.LINE_CAP_ROUND)
+    c.move_to(64, 58)
+    c.line_to(64, 94)
+    c.stroke()
+
+
+@icon("calendar")  # a year in the album list
+def _(c):
+    rrect(c, 14, 22, 100, 92, 14)
+    pale(c)
+    stroke(c)
+    rrect(c, 14, 22, 100, 28, 14)
+    c.set_source(grad(RED, 14, 22, 114, 50))
+    c.fill()
+    bar(c, 40, 12, 40, 32, BLUE, W * 0.9)
+    bar(c, 88, 12, 88, 32, BLUE, W * 0.9)
+    for r in range(2):
+        for k in range(3):
+            dot(c, 36 + k * 28, 70 + r * 24, 7)
 
 
 @icon("undoall")  # the painted undo with a red cross badge
