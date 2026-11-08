@@ -1,0 +1,101 @@
+# Pizzicato
+
+A fast, non-destructive photo manager and editor for Linux, in the spirit of
+Picasa 3. Written in Free Pascal/Lazarus (UI) with a small C core (decoding and
+pixel kernels).
+
+* **Never touches your photos.** Edits are stored in the per-folder
+  `.picasa.ini` files, in Picasa's own format, so edits made in Picasa
+  show up in Pizzicato and the other way round.
+* **Picasa-style library**: every folder in one continuous scroll with folder
+  headers, a year/folder tree, a thumbnail size slider, stars, and a
+  "Starred only" filter.
+* **Fast thumbnail cache** in SQLite (WAL mode), with JPEG blobs of 320 px on
+  the long edge. Writes are batched, and each worker thread has its own read
+  connection.
+* **Formats**: JPEG, PNG, GIF, WebP, HEIC/HEIF/AVIF, and camera RAW (DNG, PEF,
+  CR2/CR3, NEF, ARW, ORF, RW2, RAF and others) via LibRaw.
+* **RAW speed**: thumbnails come from the JPEG previews embedded in the raw
+  file, found by its own TIFF/MakerNote walker. That costs one 256 KB read and
+  no demosaic. The viewer uses the full-size camera preview when the file has
+  one (Pentax). Otherwise it does a LibRaw half-size decode. A toggle switches
+  to LibRaw rendering for all raws.
+
+## Build
+
+Requirements: FPC 3.2, a built Lazarus tree (gtk2 LCL), gcc, and the -dev
+packages for libjpeg-turbo, libpng, giflib, libwebp, libheif and sqlite3.
+LibRaw 0.20 runtime (`libraw_r.so.20`) plus the matching headers are in
+`third_party/libraw-0.20.2-include`.
+
+    make                               # system Lazarus in /usr/lib/lazarus/default/
+    make LAZDIR=/path/to/lazarus/      # or a built Lazarus tree; trailing slash required
+
+Tested with Lazarus 2.2 (Ubuntu 22.04 package) and 4.2.
+
+Run `make pretty` before committing. It formats the C core with astyle,
+using mcx/mcxcl's options, and the Pascal sources with JCF
+(`tools/jcfsettings.cfg`).
+
+The build produces `./pizzicato`. The C core and its benchmark tool are in
+`core/` (`core/pzbench`).
+
+## Run
+
+    ./pizzicato ~/Pictures            # add folders as library roots (not saved)
+    ./pizzicato photo.dng             # open a single photo in the editor
+    PZ_DB=/local/disk/pz.db ./pizzicato   # put the thumbnail cache somewhere local
+
+Without arguments it uses the roots saved via *Add Folder…*, or `~/Pictures`.
+The cache defaults to `$XDG_CACHE_HOME/pizzicato/library.db`. Keep it on a
+local disk, because SQLite WAL on NFS is slow and unsafe.
+
+### Keys
+
+| Where   | Key                         | Action                         |
+|---------|-----------------------------|--------------------------------|
+| Library | arrows, PgUp/PgDn, Home/End | move / scroll                  |
+| Library | Enter, double-click         | open in editor                 |
+| Library | Ctrl+wheel                  | thumbnail size                 |
+| Both    | Ctrl+8                      | toggle star                    |
+| Both    | Ctrl+] / Ctrl+[             | rotate clockwise / counter-clockwise |
+| Editor  | ←/→, PgUp/PgDn, Space       | previous / next photo          |
+| Editor  | Ctrl+Z / Ctrl+Y             | undo / redo                    |
+| Editor  | 1                           | toggle 100% (drag to pan)      |
+| Editor  | Esc                         | cancel crop, else back to library |
+
+## Picasa compatibility
+
+| `.picasa.ini` key / filter | Status |
+|---|---|
+| `star=yes`, `rotate=rotate(n)` | read + write |
+| `filters=` chain, `redo=` (undo stack) | read + write, unknown entries kept verbatim |
+| `fill`, `finetune2` (fill, highlights, shadows, neutral colour, temperature) | rendered |
+| `autolight`, `autocolor`, `enhance` | rendered |
+| `crop64`, `tilt` | rendered |
+| `sat`, `Boost`, `bw`, `sepia`, `warm`, `unsharp2` | rendered |
+| `retouch` | kept, **not rendered** (Picasa stores the retouch data elsewhere) |
+| `pzbc` (brightness/contrast), `pzvignette`, `pzsoft` | Pizzicato extensions |
+
+The filter maths approximates Picasa's look and is not a bit-exact clone.
+Picasa's implementation is closed, and there were too few original/edited
+pairs on disk to calibrate against. The straighten scale (`tilt` ±1 = ±10°)
+and the `Boost` and `sat` scales are educated guesses. Their constants are at
+the top of `src/pzrender.pas` and in `core/pzcore.c`.
+
+## Layout
+
+    core/pzcore.c      decoders, TIFF/EXIF/MakerNote walker, resampler, filters (OpenMP)
+    core/pzbench.c     command-line timing tool for the core
+    src/pzcorebind.pas Pascal bindings
+    src/pzini.pas      .picasa.ini + filter chain model
+    src/pzrender.pas   filter chain -> pixel ops
+    src/pzlibrary.pas  folders/photos model, SQLite cache, scanner, worker pool
+    src/pzviews.pas    library grid, viewer, filmstrip (custom drawn)
+    src/mainform.pas   window, edit panel; src/pzbench.inc = --bench driver
+
+## Benchmarking
+
+    ./pizzicato --bench --log=bench.txt --db=/local/pz.db <root>   # never writes .picasa.ini
+    ./pizzicato --gen-all --log=gen.txt --db=/local/pz.db <root>   # build every thumbnail
+    core/pzbench thumb|view|raw|full|filters [-j N] files...

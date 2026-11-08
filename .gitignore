@@ -1,0 +1,9 @@
+build/
+pizzicato
+core/*.o
+core/*.a
+core/pzbench
+lib/
+*.db
+*.db-*
+bench/*.txt
