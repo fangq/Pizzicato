@@ -98,6 +98,7 @@ type
   end;
 
   TPzViewMode = (vmNormal, vmCrop, vmPick);
+  TPzWheelEvent = procedure(Sender: TObject; Delta: Integer) of object;
   TPzPickEvent = procedure(Sender: TObject; NX, NY: Double) of object;
 
   { TPzViewer }
@@ -107,10 +108,16 @@ type
     FBmp: TBitmap;        // rendered image (owned)
     FPlaceholder: TBitmap; // not owned
     FZoom100: Boolean;
-    FPanX, FPanY: Integer;
+    FZoomU, FZoomV: Double;  // 1:1: the image point (0..1) at the view's centre
+    FStartU, FStartV: Double;
     FDragging: Boolean;
     FDragStart: TPoint;
-    FPanStart: TPoint;
+    FMoved: Boolean;         // the press became a drag
+    FIgnoreUp: Boolean;      // the release of the double-click that zoomed in
+    FHandCursor, FGrabCursor: TCursor;
+    FOnZoomAt: TPzPickEvent;
+    FOnUnzoom: TNotifyEvent;
+    FOnWheelNav: TPzWheelEvent;
     FMode: TPzViewMode;
     FCropAspect: Double; // 0 = free
     FCropA, FCropB: TPoint; // in image coords of FBmp
@@ -119,6 +126,7 @@ type
     FOnNav: TNotifyEvent;
     FInfo: string;
     FShowGrid: Boolean;
+    procedure SetZoom100(AValue: Boolean);
     procedure SetShowGrid(AValue: Boolean);
     function ImageRect: TRect;
     function ToImage(X, Y: Integer): TPoint;
@@ -128,14 +136,23 @@ type
       X, Y: Integer); override;
     procedure MouseMove(Shift: TShiftState; X, Y: Integer); override;
     procedure MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Integer); override;
+    function DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+      MousePos: TPoint): Boolean; override;
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
+    procedure SetZoomCenter(U, V: Double);
+    function FitPointToImage(X, Y: Integer; out U, V: Double): Boolean;
     procedure SetImage(B: TBitmap);   // takes ownership
     procedure SetPlaceholder(B: TBitmap);
     procedure SetMode(M: TPzViewMode);
     function CropRectNorm(out L, T, R, B: Double): Boolean;
-    property Zoom100: Boolean read FZoom100 write FZoom100;
+    property Zoom100: Boolean read FZoom100 write SetZoom100;
+    property HandCursor: TCursor read FHandCursor write FHandCursor;
+    property GrabCursor: TCursor read FGrabCursor write FGrabCursor;
+    property OnZoomAt: TPzPickEvent read FOnZoomAt write FOnZoomAt;
+    property OnUnzoom: TNotifyEvent read FOnUnzoom write FOnUnzoom;
+    property OnWheelNav: TPzWheelEvent read FOnWheelNav write FOnWheelNav;
     property ShowGrid: Boolean read FShowGrid write SetShowGrid;
     property Mode: TPzViewMode read FMode;
     property CropAspect: Double read FCropAspect write FCropAspect;
@@ -1035,6 +1052,10 @@ begin
   Color := TColor($161616);
   DoubleBuffered := True;
   TabStop := True;
+  FZoomU := 0.5;
+  FZoomV := 0.5;
+  FHandCursor := crHandPoint;
+  FGrabCursor := crSizeAll;
 end;
 
 destructor TPzViewer.Destroy;
@@ -1077,6 +1098,38 @@ begin
   Invalidate;
 end;
 
+procedure TPzViewer.SetZoom100(AValue: Boolean);
+begin
+  FZoom100 := AValue;
+  FDragging := False;
+  if FMode = vmNormal then
+    if AValue then
+      Cursor := FHandCursor
+    else
+      Cursor := crDefault;
+  Invalidate;
+end;
+
+procedure TPzViewer.SetZoomCenter(U, V: Double);
+begin
+  FZoomU := EnsureRange(U, 0, 1);
+  FZoomV := EnsureRange(V, 0, 1);
+  Invalidate;
+end;
+
+{ a point of the fitted view as a fraction of the photo }
+function TPzViewer.FitPointToImage(X, Y: Integer; out U, V: Double): Boolean;
+var
+  R: TRect;
+begin
+  R := ImageRect;
+  Result := (R.Right > R.Left) and PtInRect(R, Point(X, Y));
+  if not Result then
+    Exit;
+  U := (X - R.Left) / (R.Right - R.Left);
+  V := (Y - R.Top) / (R.Bottom - R.Top);
+end;
+
 function TPzViewer.ImageRect: TRect;
 var
   B: TBitmap;
@@ -1090,10 +1143,19 @@ begin
     Exit(Rect(0, 0, 0, 0));
   if FZoom100 and (FBmp <> nil) then
   begin
+    { 1:1, the chosen image point at the centre; never scrolled past an edge }
     w := B.Width;
     h := B.Height;
-    Result.Left := (ClientWidth - w) div 2 + FPanX;
-    Result.Top := (ClientHeight - h) div 2 + FPanY;
+    if w <= ClientWidth then
+      Result.Left := (ClientWidth - w) div 2
+    else
+      Result.Left := EnsureRange(Round(ClientWidth / 2 - FZoomU * w),
+        ClientWidth - w, 0);
+    if h <= ClientHeight then
+      Result.Top := (ClientHeight - h) div 2
+    else
+      Result.Top := EnsureRange(Round(ClientHeight / 2 - FZoomV * h),
+        ClientHeight - h, 0);
   end
   else
   begin
@@ -1219,12 +1281,21 @@ begin
             (R.Bottom - R.Top));
       end;
     else
-      if FZoom100 then
+      if (ssDouble in Shift) and not FZoom100 then
+      begin
+        { double-click: 1:1 at the clicked point }
+        FIgnoreUp := True;
+        if FitPointToImage(X, Y, FStartU, FStartV) and Assigned(FOnZoomAt) then
+          FOnZoomAt(Self, FStartU, FStartV);
+      end
+      else if FZoom100 and not (ssDouble in Shift) then
       begin
         FDragging := True;
+        FMoved := False;
         FDragStart := Point(X, Y);
-        FPanStart := Point(FPanX, FPanY);
-        Cursor := crSizeAll;
+        FStartU := FZoomU;
+        FStartV := FZoomV;
+        Cursor := FGrabCursor;
       end;
   end;
 end;
@@ -1255,10 +1326,13 @@ begin
     FCropB := P;
     Invalidate;
   end
-  else if FZoom100 then
+  else if FZoom100 and (FBmp <> nil) then
   begin
-    FPanX := FPanStart.X + X - FDragStart.X;
-    FPanY := FPanStart.Y + Y - FDragStart.Y;
+    if Abs(X - FDragStart.X) + Abs(Y - FDragStart.Y) > 3 then
+      FMoved := True;
+    { drag the photo: the hand holds the same image point }
+    FZoomU := EnsureRange(FStartU - (X - FDragStart.X) / FBmp.Width, 0, 1);
+    FZoomV := EnsureRange(FStartV - (Y - FDragStart.Y) / FBmp.Height, 0, 1);
     Invalidate;
   end;
 end;
@@ -1266,9 +1340,31 @@ end;
 procedure TPzViewer.MouseUp(Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
 begin
   inherited MouseUp(Button, Shift, X, Y);
+  if FIgnoreUp then
+  begin
+    FIgnoreUp := False;
+    FDragging := False;
+    Exit;
+  end;
+  if FDragging and FZoom100 and (FMode = vmNormal) then
+  begin
+    FDragging := False;
+    Cursor := FHandCursor;
+    { a click without a drag goes back to the fitted view }
+    if not FMoved and Assigned(FOnUnzoom) then
+      FOnUnzoom(Self);
+    Exit;
+  end;
   FDragging := False;
-  if FMode = vmNormal then
-    Cursor := crDefault;
+end;
+
+function TPzViewer.DoMouseWheel(Shift: TShiftState; WheelDelta: Integer;
+  MousePos: TPoint): Boolean;
+begin
+  { the wheel walks through the photos, as along the filmstrip }
+  if Assigned(FOnWheelNav) and (WheelDelta <> 0) then
+    FOnWheelNav(Self, -Sign(WheelDelta));
+  Result := True;
 end;
 
 function TPzViewer.CropRectNorm(out L, T, R, B: Double): Boolean;

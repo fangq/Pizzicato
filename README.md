@@ -80,8 +80,11 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 | Both    | Ctrl+] / Ctrl+[             | rotate clockwise / counter-clockwise |
 | Editor  | ←/→, PgUp/PgDn, Space       | previous / next photo          |
 | Editor  | Ctrl+Z / Ctrl+Y             | undo / redo                    |
-| Editor  | 1                           | toggle 100% (drag to pan)      |
-| Editor  | Esc                         | cancel crop, else back to library |
+| Editor  | mouse wheel                 | previous / next photo          |
+| Editor  | double-click the photo      | 1:1 at that point              |
+| Editor  | in 1:1: drag / click        | move the photo / back to fit   |
+| Editor  | 1                           | toggle 1:1 at the centre       |
+| Editor  | Esc                         | leave 1:1 or crop, else back to library |
 
 ## Picasa compatibility
 

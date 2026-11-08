@@ -484,6 +484,45 @@ def _(c):
     c.restore()
 
 
+def hand(c, closed):
+    """a white glove with a dark outline: readable over any photo"""
+    c.new_path()
+    fingers = [(32, 22), (50, 12), (68, 14), (86, 26)] if not closed else [(32, 52), (50, 46), (68, 46), (86, 52)]
+    for (x, top) in fingers:
+        rrect(c, x, top, 16, 80 - top, 8)
+    # palm
+    rrect(c, 30, 56, 74, 58, 22)
+    # thumb
+    c.save()
+    c.translate(30, 78)
+    c.rotate(-0.9 if not closed else -0.3)
+    rrect(c, -8, -34 if not closed else -18, 16, 40 if not closed else 26, 8)
+    c.restore()
+    c.set_source_rgb(0.08, 0.08, 0.10)
+    c.set_line_width(10)
+    c.set_line_join(cairo.LINE_JOIN_ROUND)
+    c.stroke_preserve()
+    c.set_source_rgb(1, 1, 1)
+    c.fill()
+    # finger separations
+    c.set_source_rgb(0.08, 0.08, 0.10)
+    c.set_line_width(4)
+    for (x, top) in fingers[1:]:
+        c.move_to(x, max(top, 56) + 6)
+        c.line_to(x, 76)
+    c.stroke()
+
+
+@icon("hand")  # the 1:1 view's cursor: an open hand
+def _(c):
+    hand(c, False)
+
+
+@icon("grab")  # while dragging: a closed hand
+def _(c):
+    hand(c, True)
+
+
 @icon("undoall")  # the painted undo with a red cross badge
 def _(c):
     painted(c, "undo")

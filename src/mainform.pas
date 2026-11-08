@@ -120,6 +120,10 @@ type
     function AddTile(AParent: TWinControl; const ACaption, AIcon, AHint: string;
       X, Y: Integer; H: TNotifyEvent): TSpeedButton;
     procedure StraightenClick(Sender: TObject);
+    procedure ViewerZoomAt(Sender: TObject; NX, NY: Double);
+    procedure ViewerUnzoom(Sender: TObject);
+    procedure ViewerWheel(Sender: TObject; Delta: Integer);
+    procedure MakeCursors;
     procedure CaptionKeyPress(Sender: TObject; var Key: Char);
     procedure CaptionExit(Sender: TObject);
     procedure SaveCaption;
@@ -515,6 +519,7 @@ begin
   BuildEditPanel;
   BuildBottomBar;
   BuildRightPanel;
+  MakeCursors;
 
   TmrIni := TTimer.Create(Self);
   TmrIni.Enabled := False;
@@ -773,7 +778,7 @@ begin
   Strip := TPzStrip.Create(Self);
   Strip.Parent := PnlEdit;
   Strip.Align := alBottom;
-  Strip.Height := 84;
+  Strip.Height := 68;
   Strip.OnPick := @StripPick;
 
   { Picasa's caption line under the photo }
@@ -797,6 +802,9 @@ begin
   Viewer.Parent := PnlEdit;
   Viewer.Align := alClient;
   Viewer.OnPick := @ViewerPick;
+  Viewer.OnZoomAt := @ViewerZoomAt;
+  Viewer.OnUnzoom := @ViewerUnzoom;
+  Viewer.OnWheelNav := @ViewerWheel;
   Viewer.OnResize := @ViewerResize;
   B := nil;
   if B = nil then;
@@ -1119,9 +1127,11 @@ begin
     Lvl := 2;
   if CacheFind(R.Photo, Lvl) <> nil then
     Exit; // already have something at least as good
-  { replace lower levels of the same photo }
+  { replace lower levels of the same photo -- but keep the screen-size image
+    next to a full-resolution one: the fitted view renders from it, fast }
   for i := Cache.Count - 1 downto 0 do
-    if (TViewEntry(Cache[i]).Photo = R.Photo) and (TViewEntry(Cache[i]).Level < Lvl) then
+    if (TViewEntry(Cache[i]).Photo = R.Photo) and (TViewEntry(Cache[i]).Level < Lvl) and
+      not ((Lvl = 3) and (TViewEntry(Cache[i]).Level = 2)) then
     begin
       TViewEntry(Cache[i]).Free;
       Cache.Delete(i);
@@ -1212,9 +1222,7 @@ begin
   RequestViews(Grid.NextPhoto(P, -1), False);
   if N <> nil then
     RequestViews(Grid.NextPhoto(N, 1), False);
-  UpdateStatus;
-  if PnlRight.Visible then
-    SelectionChanged;
+  SelectionChanged;
 end;
 
 procedure TMainForm.Navigate(Delta: Integer);
@@ -1254,7 +1262,12 @@ begin
   if Viewer.Zoom100 then
     E := CacheFind(Cur, 3)
   else
-    E := nil;
+    E := CacheFind(Cur, 2);
+  { the fitted view: the screen-size image when there is one }
+  if (E <> nil) and (E.Level = 3) and not Viewer.Zoom100 then
+    for W := 0 to Cache.Count - 1 do
+      if (TViewEntry(Cache[W]).Photo = Cur) and (TViewEntry(Cache[W]).Level = 2) then
+        E := TViewEntry(Cache[W]);
   if E = nil then
     E := CacheFind(Cur, 1);
   if E = nil then
@@ -1284,10 +1297,14 @@ begin
   if (E.Level >= 2) and (FFirstFullMs < 0) then
     FFirstFullMs := (NowSeconds - FOpenT0) * 1000;
   case E.Level of
-    1: Info := 'preview';
-    2: Info := 'screen';
-    3: Info := '100%';
+    1: Info := 'embedded preview';
+    2: Info := 'screen size';
+    3: Info := 'full resolution';
   end;
+  if Viewer.Zoom100 then
+    Info := '1:1 (drag to move, click to fit) · ' + Info
+  else
+    Info := 'fit · ' + Info;
   Viewer.Info := Format('%dx%d  %s  ·  %s  ·  render %.0f ms',
     [Cur.W, Cur.H, Cur.Camera, Info, FLastRenderMs]);
   Viewer.Invalidate;
@@ -1705,6 +1722,8 @@ procedure TMainForm.ZoomClick(Sender: TObject);
 begin
   if Cur = nil then
     Exit;
+  if not Viewer.Zoom100 and (Sender <> Viewer) then
+    Viewer.SetZoomCenter(0.5, 0.5);
   Viewer.Zoom100 := not Viewer.Zoom100;
   if Viewer.Zoom100 and (CacheFind(Cur, 3) = nil) then
     Lib.RequestView(Cur, 0, 0, RawFlags or PZ_RAW_FULL, -1, True);
@@ -1784,10 +1803,7 @@ begin
     Exit;
   L := TList.Create;
   try
-    if FEditMode then
-      L.Add(Cur)
-    else
-      TrayPhotos(L);
+    TrayPhotos(L);
     if L.Count > 0 then
       ExportPhotos(L, Dir);
   finally
@@ -1824,7 +1840,8 @@ begin
     else if Key in [VK_LEFT, VK_PRIOR, VK_BACK] then Navigate(-1)
     else if Key = VK_ESCAPE then
     begin
-      if Viewer.Mode <> vmNormal then CropCancelClick(nil)
+      if Viewer.Zoom100 then ZoomClick(nil)
+      else if Viewer.Mode <> vmNormal then CropCancelClick(nil)
       else
         SetEditMode(False);
     end
@@ -1925,7 +1942,7 @@ var
 
 begin
   PnlBottom := TPanel.Create(Self);
-  PnlBottom.Parent := PnlLibrary;
+  PnlBottom.Parent := Self; // shown under the library and the editor alike
   PnlBottom.Align := alBottom;
   PnlBottom.Height := 112;
   PnlBottom.BevelOuter := bvNone;
@@ -2149,7 +2166,10 @@ begin
   L.Clear;
   if FEditMode then
   begin
-    if Cur <> nil then
+    { the editor's tray: the held photos and the one being edited }
+    for i := 0 to Held.Count - 1 do
+      L.Add(Held[i]);
+    if (Cur <> nil) and not Cur.Held then
       L.Add(Cur);
     Exit;
   end;
@@ -2178,8 +2198,7 @@ begin
   L := TList.Create;
   try
     TrayPhotos(L);
-    if not FEditMode then
-      Tray.SetPhotos(L);
+    Tray.SetPhotos(L);
     Bytes := 0;
     T0 := High(Int64);
     T1 := 0;
@@ -2203,7 +2222,14 @@ begin
         FormatDateTime('yyyymmdd', UnixToDateTimeSafe(T1)) then
         Dates := Dates + ' – ' + FormatDateTime('mmm d, yyyy', UnixToDateTimeSafe(T1));
     end;
-    if L.Count = 0 then
+    if FEditMode and (Cur <> nil) then
+      { Picasa's line in the edit view: where, when, how big, which of how many }
+      LblSummary.Caption := Format(
+        '%s  >  %s     %s     %d x %d pixels     %.1f MB     (%d of %d)%s',
+        [Cur.Folder.Name, Cur.Name, FormatTaken(Cur.Taken), Cur.W,
+        Cur.H, Cur.Size / 1048576, Cur.Index + 1, Cur.Folder.Count,
+        IfThen(Held.Count > 0, Format('     %d held', [Held.Count]), '')])
+    else if L.Count = 0 then
       LblSummary.Caption :=
         'No selection — click, Ctrl+click or Shift+click photos; Hold keeps them here'
     else
@@ -2596,7 +2622,13 @@ var
 begin
   L := TList.Create;
   try
-    Grid.SelectionList(L);
+    if FEditMode then
+    begin
+      if Cur <> nil then
+        L.Add(Cur);
+    end
+    else
+      Grid.SelectionList(L);
     for i := 0 to L.Count - 1 do
       if not TPzPhoto(L[i]).Held then
       begin
@@ -2725,6 +2757,11 @@ end;
 
 procedure TMainForm.TrayPick(Sender: TObject; P: TPzPhoto);
 begin
+  if FEditMode then
+  begin
+    ShowPhoto(P);
+    Exit;
+  end;
   if Grid.IsShown(P) and (P.Folder <> nil) and P.Folder.Visible then
     Grid.EnsureVisible(P);
 end;
@@ -2979,6 +3016,67 @@ begin
     RemoveTagClick(nil);
     Key := 0;
   end;
+end;
+
+{ ---------------- 1:1 view: hand cursors, double-click, click, wheel ---------------- }
+
+const
+  crPzHand = 21;
+  crPzGrab = 22;
+
+procedure TMainForm.MakeCursors;
+
+  function Make(const AIcon: string; ID: TCursor): Boolean;
+  var
+    Bmp: TBitmap;
+    CI: TCursorImage;
+  begin
+    Result := False;
+    Bmp := PzIconBitmap(AIcon, 32);
+    if Bmp = nil then
+      Exit;
+    CI := TCursorImage.Create;
+    try
+      CI.Assign(Bmp);
+      CI.HotSpot := Point(Bmp.Width div 2, Bmp.Height div 2);
+      Screen.Cursors[ID] := CI.ReleaseHandle;
+      Result := True;
+    except
+      Result := False;
+    end;
+    CI.Free;
+    Bmp.Free;
+  end;
+
+begin
+  if Make('hand', crPzHand) then
+    Viewer.HandCursor := crPzHand
+  else
+    Viewer.HandCursor := crHandPoint;
+  if Make('grab', crPzGrab) then
+    Viewer.GrabCursor := crPzGrab
+  else
+    Viewer.GrabCursor := crSizeAll;
+end;
+
+procedure TMainForm.ViewerZoomAt(Sender: TObject; NX, NY: Double);
+begin
+  if (Cur = nil) or Viewer.Zoom100 then
+    Exit;
+  Viewer.SetZoomCenter(NX, NY);
+  ZoomClick(Viewer);
+end;
+
+procedure TMainForm.ViewerUnzoom(Sender: TObject);
+begin
+  if Viewer.Zoom100 then
+    ZoomClick(Viewer);
+end;
+
+procedure TMainForm.ViewerWheel(Sender: TObject; Delta: Integer);
+begin
+  if Viewer.Mode = vmNormal then
+    Navigate(Delta);
 end;
 
 {$I pzbench.inc}
