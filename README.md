@@ -26,6 +26,14 @@ pixel kernels).
   * A Tags panel: type a tag and press +, see the photo's tags, and use ten
     Quick Tags (the gear configures them). A Quick Tag is bold when every photo
     in the tray has it, and clicking it adds or removes the tag.
+* **Context menus**:
+  * On a photo (library or full view): open, open with the default
+    application, star, rotate, tag, hold, copy/paste/undo edits (Picasa's
+    "copy all effects"), export, copy the path, show in the file manager,
+    properties.
+  * On an album (folder list or folder header): select or hold all, export
+    the album, edit its description (Picasa's `[Picasa] description=`), show it
+    in the file manager, copy its path, rescan it.
 * **Fast thumbnail cache** in SQLite (WAL mode), with JPEG blobs of 320 px on
   the long edge. Writes are batched, and each worker thread has its own read
   connection.
@@ -90,7 +98,7 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 
 | `.picasa.ini` key / filter | Status |
 |---|---|
-| `star=yes`, `rotate=rotate(n)`, `keywords=` (tags), `caption=` | read + write |
+| `star=yes`, `rotate=rotate(n)`, `keywords=` (tags), `caption=`, `[Picasa] description=` | read + write |
 | `filters=` chain, `redo=` (undo stack) | read + write, unknown entries kept verbatim |
 | `fill`, `finetune2` (fill, highlights, shadows, neutral colour, temperature) | rendered |
 | `autolight`, `autocolor`, `enhance` | rendered |

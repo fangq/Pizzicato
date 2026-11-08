@@ -71,6 +71,7 @@ type
     procedure Relayout;
     procedure SetScrollY(Y: Integer);
     function HitTest(X, Y: Integer): TPzPhoto;
+    function HitFolder(X, Y: Integer): TPzFolder;   // the folder under a point
     procedure ScrollToFolder(F: TPzFolder);
     procedure EnsureVisible(P: TPzPhoto);
     procedure Select(P: TPzPhoto; Mode: TPzSelMode = smReplace);
@@ -94,6 +95,7 @@ type
     property OnOpen: TPzPhotoEvent read FOnOpen write FOnOpen;
     property OnSelect: TPzPhotoEvent read FOnSelect write FOnSelect;
     property OnTopFolder: TNotifyEvent read FOnTopFolder write FOnTopFolder;
+    property OnContextPopup;
     property Shown: TList read FShown;
   end;
 
@@ -153,6 +155,7 @@ type
     property OnZoomAt: TPzPickEvent read FOnZoomAt write FOnZoomAt;
     property OnUnzoom: TNotifyEvent read FOnUnzoom write FOnUnzoom;
     property OnWheelNav: TPzWheelEvent read FOnWheelNav write FOnWheelNav;
+    property OnContextPopup;
     property ShowGrid: Boolean read FShowGrid write SetShowGrid;
     property Mode: TPzViewMode read FMode;
     property CropAspect: Double read FCropAspect write FCropAspect;
@@ -612,7 +615,10 @@ begin
         C.Font.Style := [];
         C.Font.Height := -12;
         C.Font.Color := clPzSub;
-        Sub := Format('%d photos   %s', [F.Count, ExtractFileDir(F.Path)]);
+        if F.Description <> '' then
+          Sub := Format('%d photos   —  %s', [F.Count, F.Description])
+        else
+          Sub := Format('%d photos   %s', [F.Count, ExtractFileDir(F.Path)]);
         C.TextOut(j + C.TextWidth(Hdr) * 15 div 12 + 24, F.Top -
           FScrollY + 13, Sub);
         C.Pen.Color := TColor($3A3A3A);
@@ -777,6 +783,21 @@ begin
     TPzPhoto(FSel[i]).Selected := False;
   FSel.Clear;
   Invalidate;
+end;
+
+function TPzGrid.HitFolder(X, Y: Integer): TPzFolder;
+var
+  i, cy: Integer;
+  F: TPzFolder;
+begin
+  Result := nil;
+  cy := Y + FScrollY;
+  for i := 0 to FShown.Count - 1 do
+  begin
+    F := TPzFolder(FShown[i]);
+    if (cy >= F.Top) and (cy < F.Top + F.Height) then
+      Exit(F);
+  end;
 end;
 
 procedure TPzGrid.Select(P: TPzPhoto; Mode: TPzSelMode);

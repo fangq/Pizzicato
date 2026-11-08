@@ -84,6 +84,7 @@ type
     Photos: TList;
     Ini: TPzIni;
     IniLoaded: Boolean;
+    Description: string; // Picasa's [Picasa] description=
     { layout, owned by the grid }
     Top, Height: Integer;
     Visible: Boolean;
@@ -94,6 +95,7 @@ type
     function Count: Integer; inline;
     procedure EnsureIni;
     procedure SavePhotoEdits(P: TPzPhoto);
+    procedure SetDescription(const S: string);
     procedure FlushIni;
   end;
 
@@ -430,6 +432,7 @@ begin
   IniLoaded := True;
   Ini := TPzIni.Create(Path + '/.picasa.ini');
   Ini.Load;
+  Description := Ini.ReadValue('Picasa', 'description');
   for i := 0 to Count - 1 do
   begin
     P := Photo(i);
@@ -440,6 +443,13 @@ begin
     P.Keywords := Ini.ReadValue(P.Name, 'keywords');
     P.Caption := Ini.ReadValue(P.Name, 'caption');
   end;
+end;
+
+procedure TPzFolder.SetDescription(const S: string);
+begin
+  EnsureIni;
+  Description := S;
+  Ini.WriteValue('Picasa', 'description', S);
 end;
 
 procedure TPzFolder.SavePhotoEdits(P: TPzPhoto);
@@ -979,7 +989,12 @@ var
   i: Integer;
 begin
   if FScanner <> nil then
-    Exit;
+  begin
+    if not FScanner.Finished then
+      Exit;
+    FScanner.WaitFor; // a finished scan: start another (Rescan folder)
+    FreeAndNil(FScanner);
+  end;
   Known := TStringList.Create;
   try
     for i := 0 to Folders.Count - 1 do

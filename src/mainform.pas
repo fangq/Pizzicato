@@ -9,7 +9,7 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
-  LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils,
+  LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
   Buttons, ImgList,
   pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons;
 
@@ -60,6 +60,12 @@ type
     TreeIcons: TImageList;
     Held: TList;             // photos pinned in the tray
     FPropsQueued: Boolean;
+    { context menus }
+    PmPhoto, PmView, PmFolder: TPopupMenu;
+    MiOpen, MiZoom, MiPastePhoto, MiPasteView: TMenuItem;
+    MiFSelect, MiFHold, MiFExport, MiFDesc, MiFShow, MiFCopy, MiFRescan: TMenuItem;
+    FMenuFolder: TPzFolder;
+    FEditsClip: string;      // "Copy Edits": a filter chain
     ChkRawPreview: TCheckBox;
     TrkSize: TTrackBar;
     LblStatus: TLabel;
@@ -124,6 +130,40 @@ type
     procedure ViewerUnzoom(Sender: TObject);
     procedure ViewerWheel(Sender: TObject; Delta: Integer);
     procedure MakeCursors;
+    function AddMI(AMenu: TPopupMenu; const ACaption, AIcon, AKeys: string;
+      H: TNotifyEvent): TMenuItem;
+    procedure BuildMenus;
+    procedure TargetPhotos(L: TList);
+    procedure StarList(L: TList);
+    procedure RotateList(L: TList; Delta: Integer);
+    procedure GridContextPopup(Sender: TObject; MousePos: TPoint; var Handled: Boolean);
+    procedure ViewerContextPopup(Sender: TObject; MousePos: TPoint;
+      var Handled: Boolean);
+    procedure TreeContextPopup(Sender: TObject; MousePos: TPoint; var Handled: Boolean);
+    procedure PopupFolderMenu;
+    procedure MOpenClick(Sender: TObject);
+    procedure MDefaultAppClick(Sender: TObject);
+    procedure MStarClick(Sender: TObject);
+    procedure MRotRClick(Sender: TObject);
+    procedure MRotLClick(Sender: TObject);
+    procedure MCopyEditsClick(Sender: TObject);
+    procedure MPasteEditsClick(Sender: TObject);
+    procedure MUndoAllClick(Sender: TObject);
+    procedure MExportClick(Sender: TObject);
+    procedure MCopyPathClick(Sender: TObject);
+    procedure MShowFileClick(Sender: TObject);
+    procedure MSelectAllClick(Sender: TObject);
+    procedure MPropsClick(Sender: TObject);
+    procedure MZoomClick(Sender: TObject);
+    procedure MFSelectClick(Sender: TObject);
+    procedure MFHoldClick(Sender: TObject);
+    procedure MFExportClick(Sender: TObject);
+    procedure MFDescClick(Sender: TObject);
+    procedure MFShowClick(Sender: TObject);
+    procedure MFCopyClick(Sender: TObject);
+    procedure MFRescanClick(Sender: TObject);
+    procedure MFExpandClick(Sender: TObject);
+    procedure MFCollapseClick(Sender: TObject);
     procedure CaptionKeyPress(Sender: TObject; var Key: Char);
     procedure CaptionExit(Sender: TObject);
     procedure SaveCaption;
@@ -520,6 +560,10 @@ begin
   BuildBottomBar;
   BuildRightPanel;
   MakeCursors;
+  BuildMenus;
+  Grid.OnContextPopup := @GridContextPopup;
+  Viewer.OnContextPopup := @ViewerContextPopup;
+  Tree.OnContextPopup := @TreeContextPopup;
 
   TmrIni := TTimer.Create(Self);
   TmrIni.Enabled := False;
@@ -2655,62 +2699,40 @@ end;
 procedure TMainForm.TStarClick(Sender: TObject);
 var
   L: TList;
-  i: Integer;
-  All: Boolean;
 begin
   L := TList.Create;
   try
     TrayPhotos(L);
-    All := L.Count > 0;
-    for i := 0 to L.Count - 1 do
-    begin
-      TPzPhoto(L[i]).Folder.EnsureIni;
-      All := All and TPzPhoto(L[i]).Star;
-    end;
-    { like Picasa: star them all, or unstar if every one is starred }
-    for i := 0 to L.Count - 1 do
-      if TPzPhoto(L[i]).Star = All then
-        ToggleStar(TPzPhoto(L[i]));
+    StarList(L);
   finally
     L.Free;
   end;
-  Tray.Invalidate;
-  if PnlRight.Visible then
-    UpdateProps;
 end;
 
 procedure TMainForm.TRotLClick(Sender: TObject);
 var
   L: TList;
-  i: Integer;
 begin
   L := TList.Create;
   try
     TrayPhotos(L);
-    for i := 0 to L.Count - 1 do
-      RotatePhoto(TPzPhoto(L[i]), -1);
+    RotateList(L, -1);
   finally
     L.Free;
   end;
-  if PnlRight.Visible then
-    UpdateProps;
 end;
 
 procedure TMainForm.TRotRClick(Sender: TObject);
 var
   L: TList;
-  i: Integer;
 begin
   L := TList.Create;
   try
     TrayPhotos(L);
-    for i := 0 to L.Count - 1 do
-      RotatePhoto(TPzPhoto(L[i]), 1);
+    RotateList(L, 1);
   finally
     L.Free;
   end;
-  if PnlRight.Visible then
-    UpdateProps;
 end;
 
 procedure TMainForm.TTagClick(Sender: TObject);
@@ -3077,6 +3099,516 @@ procedure TMainForm.ViewerWheel(Sender: TObject; Delta: Integer);
 begin
   if Viewer.Mode = vmNormal then
     Navigate(Delta);
+end;
+
+{ ---------------- context menus: photos, the photo view, albums ---------------- }
+
+function TMainForm.AddMI(AMenu: TPopupMenu; const ACaption, AIcon, AKeys: string;
+  H: TNotifyEvent): TMenuItem;
+var
+  Bmp: TBitmap;
+begin
+  Result := TMenuItem.Create(AMenu);
+  if ACaption = '-' then
+  begin
+    Result.Caption := '-';
+    AMenu.Items.Add(Result);
+    Exit;
+  end;
+  Result.Caption := ACaption;
+  Result.OnClick := H;
+  if AKeys <> '' then
+    Result.ShortCut := TextToShortCut(AKeys); // shown only: the menus are not attached
+  if AIcon <> '' then
+  begin
+    Bmp := PzIconBitmap(AIcon, 16);
+    if Bmp <> nil then
+      try
+        Result.Bitmap.Assign(Bmp);
+      finally
+        Bmp.Free;
+      end;
+  end;
+  AMenu.Items.Add(Result);
+end;
+
+procedure TMainForm.BuildMenus;
+begin
+  { a photo in the library grid }
+  PmPhoto := TPopupMenu.Create(Self);
+  MiOpen := AddMI(PmPhoto, 'Open in Editor', 'zoom100', 'Enter', @MOpenClick);
+  AddMI(PmPhoto, 'Open with Default Application', '', '', @MDefaultAppClick);
+  AddMI(PmPhoto, '-', '', '', nil);
+  AddMI(PmPhoto, 'Star / Unstar', 'star', 'Ctrl+8', @MStarClick);
+  AddMI(PmPhoto, 'Rotate Clockwise', 'rotright', 'Ctrl+]', @MRotRClick);
+  AddMI(PmPhoto, 'Rotate Counter-clockwise', 'rotleft', 'Ctrl+[', @MRotLClick);
+  AddMI(PmPhoto, 'Add Tag…', 'tag', 'Ctrl+T', @TTagClick);
+  AddMI(PmPhoto, 'Hold in Tray', 'pin', '', @PinClick);
+  AddMI(PmPhoto, '-', '', '', nil);
+  AddMI(PmPhoto, 'Copy Edits', '', '', @MCopyEditsClick);
+  MiPastePhoto := AddMI(PmPhoto, 'Paste Edits', '', '', @MPasteEditsClick);
+  AddMI(PmPhoto, 'Undo All Edits', 'undoall', '', @MUndoAllClick);
+  AddMI(PmPhoto, '-', '', '', nil);
+  AddMI(PmPhoto, 'Export…', 'export', '', @MExportClick);
+  AddMI(PmPhoto, 'Copy File Path', '', '', @MCopyPathClick);
+  AddMI(PmPhoto, 'Show in File Manager', 'folder', '', @MShowFileClick);
+  AddMI(PmPhoto, '-', '', '', nil);
+  AddMI(PmPhoto, 'Select All in Folder', 'library', 'Ctrl+A', @MSelectAllClick);
+  AddMI(PmPhoto, 'Properties', 'info', '', @MPropsClick);
+
+  { the photo view }
+  PmView := TPopupMenu.Create(Self);
+  AddMI(PmView, 'Back to Library', 'library', 'Esc', @BackClick);
+  MiZoom := AddMI(PmView, 'Actual Pixels (1:1)', 'zoom100', '1', @MZoomClick);
+  AddMI(PmView, '-', '', '', nil);
+  AddMI(PmView, 'Star / Unstar', 'star', 'Ctrl+8', @MStarClick);
+  AddMI(PmView, 'Rotate Clockwise', 'rotright', 'Ctrl+]', @MRotRClick);
+  AddMI(PmView, 'Rotate Counter-clockwise', 'rotleft', 'Ctrl+[', @MRotLClick);
+  AddMI(PmView, 'Add Tag…', 'tag', 'Ctrl+T', @TTagClick);
+  AddMI(PmView, 'Hold in Tray', 'pin', '', @PinClick);
+  AddMI(PmView, '-', '', '', nil);
+  AddMI(PmView, 'Copy Edits', '', '', @MCopyEditsClick);
+  MiPasteView := AddMI(PmView, 'Paste Edits', '', '', @MPasteEditsClick);
+  AddMI(PmView, 'Undo All Edits', 'undoall', '', @MUndoAllClick);
+  AddMI(PmView, '-', '', '', nil);
+  AddMI(PmView, 'Export…', 'export', '', @MExportClick);
+  AddMI(PmView, 'Open with Default Application', '', '', @MDefaultAppClick);
+  AddMI(PmView, 'Show in File Manager', 'folder', '', @MShowFileClick);
+  AddMI(PmView, 'Copy File Path', '', '', @MCopyPathClick);
+  AddMI(PmView, '-', '', '', nil);
+  AddMI(PmView, 'Properties', 'info', '', @MPropsClick);
+
+  { an album: in the folder list or a folder header in the grid }
+  PmFolder := TPopupMenu.Create(Self);
+  MiFSelect := AddMI(PmFolder, 'Select All Photos', 'library', '', @MFSelectClick);
+  MiFHold := AddMI(PmFolder, 'Hold All in Tray', 'pin', '', @MFHoldClick);
+  MiFExport := AddMI(PmFolder, 'Export Album…', 'export', '', @MFExportClick);
+  AddMI(PmFolder, '-', '', '', nil);
+  MiFDesc := AddMI(PmFolder, 'Edit Description…', 'tag', '', @MFDescClick);
+  MiFShow := AddMI(PmFolder, 'Show in File Manager', 'folder', '', @MFShowClick);
+  MiFCopy := AddMI(PmFolder, 'Copy Folder Path', '', '', @MFCopyClick);
+  MiFRescan := AddMI(PmFolder, 'Rescan Folder', 'search', '', @MFRescanClick);
+  AddMI(PmFolder, '-', '', '', nil);
+  AddMI(PmFolder, 'Expand All Years', 'calendar', '', @MFExpandClick);
+  AddMI(PmFolder, 'Collapse All Years', 'calendar', '', @MFCollapseClick);
+end;
+
+{ what a photo menu acts on: the selection, or the photo being edited }
+procedure TMainForm.TargetPhotos(L: TList);
+begin
+  L.Clear;
+  if FEditMode then
+  begin
+    if Cur <> nil then
+      L.Add(Cur);
+  end
+  else
+    Grid.SelectionList(L);
+end;
+
+procedure TMainForm.StarList(L: TList);
+var
+  i: Integer;
+  All: Boolean;
+begin
+  All := L.Count > 0;
+  for i := 0 to L.Count - 1 do
+  begin
+    TPzPhoto(L[i]).Folder.EnsureIni;
+    All := All and TPzPhoto(L[i]).Star;
+  end;
+  { like Picasa: star them all, or unstar if every one is starred }
+  for i := 0 to L.Count - 1 do
+    if TPzPhoto(L[i]).Star = All then
+      ToggleStar(TPzPhoto(L[i]));
+  Tray.Invalidate;
+  if PnlRight.Visible then
+    UpdateProps;
+end;
+
+procedure TMainForm.RotateList(L: TList; Delta: Integer);
+var
+  i: Integer;
+begin
+  for i := 0 to L.Count - 1 do
+    RotatePhoto(TPzPhoto(L[i]), Delta);
+  if PnlRight.Visible then
+    UpdateProps;
+end;
+
+procedure TMainForm.GridContextPopup(Sender: TObject; MousePos: TPoint;
+  var Handled: Boolean);
+var
+  P: TPzPhoto;
+begin
+  Handled := True;
+  P := Grid.HitTest(MousePos.X, MousePos.Y);
+  if P <> nil then
+  begin
+    if not P.Selected then
+      Grid.Select(P); // right-click on another photo selects it, as in Picasa
+    MiPastePhoto.Enabled := FEditsClip <> '';
+    PmPhoto.PopUp;
+    Exit;
+  end;
+  FMenuFolder := Grid.HitFolder(MousePos.X, MousePos.Y);
+  if FMenuFolder <> nil then
+    PopupFolderMenu;
+end;
+
+procedure TMainForm.ViewerContextPopup(Sender: TObject; MousePos: TPoint;
+  var Handled: Boolean);
+begin
+  Handled := True;
+  if Cur = nil then
+    Exit;
+  if Viewer.Zoom100 then
+    MiZoom.Caption := 'Fit to Window'
+  else
+    MiZoom.Caption := 'Actual Pixels (1:1)';
+  MiPasteView.Enabled := FEditsClip <> '';
+  PmView.PopUp;
+end;
+
+procedure TMainForm.TreeContextPopup(Sender: TObject; MousePos: TPoint;
+  var Handled: Boolean);
+var
+  N: TTreeNode;
+begin
+  Handled := True;
+  N := Tree.GetNodeAt(MousePos.X, MousePos.Y);
+  if N <> nil then
+    FMenuFolder := TPzFolder(N.Data)
+  else
+    FMenuFolder := nil;
+  PopupFolderMenu;
+end;
+
+procedure TMainForm.PopupFolderMenu;
+var
+  Ok: Boolean;
+begin
+  { a year or empty space: only the expand/collapse items apply }
+  Ok := FMenuFolder <> nil;
+  MiFSelect.Enabled := Ok;
+  MiFHold.Enabled := Ok;
+  MiFExport.Enabled := Ok;
+  MiFDesc.Enabled := Ok;
+  MiFShow.Enabled := Ok;
+  MiFCopy.Enabled := Ok;
+  MiFRescan.Enabled := Ok;
+  PmFolder.PopUp;
+end;
+
+procedure TMainForm.MOpenClick(Sender: TObject);
+begin
+  if Grid.Selected <> nil then
+    GridOpen(Grid, Grid.Selected);
+end;
+
+procedure TMainForm.MDefaultAppClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    for i := 0 to Min(L.Count, 10) - 1 do // a handful, not a thousand windows
+      OpenDocument(TPzPhoto(L[i]).Path);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MStarClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    StarList(L);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MRotRClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    RotateList(L, 1);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MRotLClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    RotateList(L, -1);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MCopyEditsClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    if L.Count = 0 then
+      Exit;
+    TPzPhoto(L[0]).Folder.EnsureIni;
+    FEditsClip := TPzPhoto(L[0]).Filters;
+    if FEditsClip = '' then
+      Status.SimpleText := 'This photo has no edits to copy'
+    else
+      Status.SimpleText := 'Edits copied: ' + FEditsClip;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MPasteEditsClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+  P: TPzPhoto;
+begin
+  if FEditsClip = '' then
+    Exit;
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    for i := 0 to L.Count - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      P.Folder.EnsureIni;
+      { Picasa's "paste all effects": the copied chain replaces the photo's;
+        the old one goes on the redo stack so it can be brought back }
+      if P.Filters <> '' then
+        P.Redo := P.Filters + P.Redo;
+      P.Filters := FEditsClip;
+      EditsChanged(P);
+    end;
+  finally
+    L.Free;
+  end;
+  if FEditMode then
+    LoadSlidersFromChain;
+end;
+
+procedure TMainForm.MUndoAllClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+  P: TPzPhoto;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    for i := 0 to L.Count - 1 do
+    begin
+      P := TPzPhoto(L[i]);
+      P.Folder.EnsureIni;
+      if P.Filters = '' then
+        Continue;
+      P.Redo := P.Filters + P.Redo;
+      P.Filters := '';
+      EditsChanged(P);
+    end;
+  finally
+    L.Free;
+  end;
+  if FEditMode then
+    LoadSlidersFromChain;
+end;
+
+procedure TMainForm.MExportClick(Sender: TObject);
+var
+  L: TList;
+  Dir: string;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    if (L.Count > 0) and SelectDirectory('Export to folder',
+      GetEnvironmentVariable('HOME'), Dir) then
+      ExportPhotos(L, Dir);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MCopyPathClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+  S: string;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    S := '';
+    for i := 0 to L.Count - 1 do
+      S := S + IfThen(S = '', '', LineEnding) + TPzPhoto(L[i]).Path;
+    if S <> '' then
+      Clipboard.AsText := S;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MShowFileClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    if L.Count > 0 then
+      OpenDocument(TPzPhoto(L[0]).Folder.Path);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MSelectAllClick(Sender: TObject);
+begin
+  if Grid.Selected <> nil then
+    Grid.SelectAllInFolder(Grid.Selected.Folder);
+end;
+
+procedure TMainForm.MPropsClick(Sender: TObject);
+begin
+  PnlRight.Visible := True;
+  RightPages.ActivePage := TabProps;
+  SyncPanelButtons;
+  SelectionChanged;
+end;
+
+procedure TMainForm.MZoomClick(Sender: TObject);
+begin
+  ZoomClick(nil);
+end;
+
+procedure TMainForm.MFSelectClick(Sender: TObject);
+begin
+  if FMenuFolder = nil then
+    Exit;
+  if FEditMode then
+    SetEditMode(False);
+  FMenuFolder.EnsureIni;
+  if FMenuFolder.Count > 0 then
+  begin
+    Grid.Select(FMenuFolder.Photo(0));
+    Grid.SelectAllInFolder(FMenuFolder);
+    Grid.ScrollToFolder(FMenuFolder);
+  end;
+end;
+
+procedure TMainForm.MFHoldClick(Sender: TObject);
+var
+  k: Integer;
+  P: TPzPhoto;
+begin
+  if FMenuFolder = nil then
+    Exit;
+  for k := 0 to FMenuFolder.Count - 1 do
+  begin
+    P := FMenuFolder.Photo(k);
+    if Grid.IsShown(P) and not P.Held then
+    begin
+      P.Held := True;
+      Held.Add(P);
+    end;
+  end;
+  SelectionChanged;
+end;
+
+procedure TMainForm.MFExportClick(Sender: TObject);
+var
+  L: TList;
+  k: Integer;
+  Dir: string;
+begin
+  if FMenuFolder = nil then
+    Exit;
+  if not SelectDirectory('Export album "' + FMenuFolder.Name +
+    '" to folder', GetEnvironmentVariable('HOME'), Dir) then
+    Exit;
+  L := TList.Create;
+  try
+    for k := 0 to FMenuFolder.Count - 1 do
+      if Grid.IsShown(FMenuFolder.Photo(k)) then
+        L.Add(FMenuFolder.Photo(k));
+    if L.Count > 0 then
+      ExportPhotos(L, Dir);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MFDescClick(Sender: TObject);
+var
+  S: string;
+begin
+  if FMenuFolder = nil then
+    Exit;
+  FMenuFolder.EnsureIni;
+  S := FMenuFolder.Description;
+  if not InputQuery('Album description', 'Description of "' +
+    FMenuFolder.Name + '":', S) then
+    Exit;
+  FMenuFolder.SetDescription(Trim(S));
+  if FDirtyFolders.IndexOf(FMenuFolder) < 0 then
+    FDirtyFolders.Add(FMenuFolder);
+  TmrIni.Enabled := False;
+  TmrIni.Enabled := True;
+  Grid.Invalidate;
+end;
+
+procedure TMainForm.MFShowClick(Sender: TObject);
+begin
+  if FMenuFolder <> nil then
+    OpenDocument(FMenuFolder.Path);
+end;
+
+procedure TMainForm.MFCopyClick(Sender: TObject);
+begin
+  if FMenuFolder <> nil then
+    Clipboard.AsText := FMenuFolder.Path;
+end;
+
+procedure TMainForm.MFRescanClick(Sender: TObject);
+begin
+  if FMenuFolder = nil then
+    Exit;
+  { forget the folder's time stamp so the scanner reads it again }
+  FMenuFolder.DirMTime := 0;
+  Lib.StartScan;
+  Status.SimpleText := 'Rescanning ' + FMenuFolder.Path + ' …';
+end;
+
+procedure TMainForm.MFExpandClick(Sender: TObject);
+begin
+  Tree.FullExpand;
+end;
+
+procedure TMainForm.MFCollapseClick(Sender: TObject);
+begin
+  Tree.FullCollapse;
 end;
 
 {$I pzbench.inc}
