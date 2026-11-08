@@ -93,6 +93,9 @@ the top of `src/pzrender.pas` and in `core/pzcore.c`.
     src/pzlibrary.pas  folders/photos model, SQLite cache, scanner, worker pool
     src/pzviews.pas    library grid, viewer, filmstrip (custom drawn)
     src/mainform.pas   window, edit panel; src/pzbench.inc = --bench driver
+    src/pzicons.pas    toolbar icons, embedded from the generated src/pzicons.inc
+    tools/make_icons.py  draws the icons (LED's painted style, pycairo): `make icons`
+    data/icons/        the icons' 128 px masters
 
 ## Benchmarking
 

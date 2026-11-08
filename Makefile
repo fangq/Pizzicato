@@ -1,6 +1,7 @@
 # Pizzicato build. LAZDIR must point at a built Lazarus tree (gtk2 LCL).
 #   make              build ./pizzicato (and core/libpzcore.a, core/pzbench)
 #   make pretty       format the sources (astyle for C, JCF for Pascal)
+#   make icons        redraw the toolbar icons (python3 + pycairo) into src/pzicons.inc
 #   make test         .picasa.ini round-trip test on copies of given files: INI="a.ini b.ini"
 LAZDIR ?= /usr/lib/lazarus/default/
 FPC    ?= fpc
@@ -25,7 +26,10 @@ clean:
 	rm -rf build/* pizzicato
 	$(MAKE) -C core clean
 
-.PHONY: all clean pretty pretty-c pretty-pas test
+.PHONY: all clean pretty pretty-c pretty-pas test icons
+
+icons:
+	python3 tools/make_icons.py
 
 # ---- formatting: astyle options as in mcx/mcxcl, JCF as in Soloi ----
 ASTYLE      ?= astyle

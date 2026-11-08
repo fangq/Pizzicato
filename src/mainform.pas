@@ -10,7 +10,8 @@ interface
 uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
   LCLType, LCLIntf, IniFiles, Math, Menus, DateUtils,
-  pzcorebind, pzini, pzrender, pzlibrary, pzviews;
+  Buttons, ImgList,
+  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons;
 
 type
   TViewEntry = class
@@ -34,9 +35,12 @@ type
     Settings: TIniFile;
     { library mode }
     PnlTop: TPanel;
-    BtnAdd: TButton;
+    BtnAdd: TBitBtn;
     EdSearch: TEdit;
-    ChkStar: TCheckBox;
+    ChkStar: TSpeedButton;   // 'starred only' toggle
+    ImgSearch, ImgSize: TImage;
+    TabIcons: TImageList;
+    FEffNames: TStringList;  // filter name of each effect button, by Tag
     ChkRawPreview: TCheckBox;
     TrkSize: TTrackBar;
     LblStatus: TLabel;
@@ -48,7 +52,7 @@ type
     PnlEdit: TPanel;
     PnlEditTop: TPanel;
     BtnBack, BtnStar, BtnRotL, BtnRotR, BtnZoom, BtnExport, BtnUndo,
-    BtnRedo, BtnUndoAll: TButton;
+    BtnRedo, BtnUndoAll: TBitBtn;
     LblName: TLabel;
     PnlTools: TPanel;
     Pages: TPageControl;
@@ -56,7 +60,7 @@ type
     Strip: TPzStrip;
     Sliders: array[TSliderKind] of TTrackBar;
     CmbAspect: TComboBox;
-    BtnCrop, BtnCropApply, BtnCropCancel, BtnPick: TButton;
+    BtnCrop, BtnCropApply, BtnCropCancel, BtnPick: TBitBtn;
     LblInfo: TLabel;
     Status: TStatusBar;
     TmrIni, TmrStatus: TTimer;
@@ -87,7 +91,8 @@ type
     function AddSlider(AParent: TWinControl; const ACaption: string;
       AMin, AMax: Integer; K: TSliderKind; var Y: Integer): TTrackBar;
     function AddButton(AParent: TWinControl; const ACaption: string;
-      X, Y, W: Integer; Handler: TNotifyEvent): TButton;
+      X, Y, W: Integer; Handler: TNotifyEvent; const AIcon: string = ''): TBitBtn;
+    function AddIcon(AParent: TWinControl; const AIcon: string; X, Y: Integer): TImage;
     procedure LibResult(R: TPzResult);
     procedure LibScanDir(Sender: TObject);
     procedure LibScanDone(Sender: TObject);
@@ -293,6 +298,7 @@ begin
     TViewEntry(Cache[i]).Free;
   Cache.Free;
   FDirtyFolders.Free;
+  FEffNames.Free;
   Settings.Free;
   if FBenchLogOpen then
     CloseFile(FBenchLog);
@@ -338,33 +344,38 @@ begin
   PnlTop.BevelOuter := bvNone;
   PnlTop.Color := TColor($303030);
 
-  BtnAdd := AddButton(PnlTop, 'Add Folder…', 8, 6, 100, @AddFolderClick);
+  BtnAdd := AddButton(PnlTop, 'Add Folder…', 8, 6, 124, @AddFolderClick, 'addfolder');
+  ImgSearch := AddIcon(PnlTop, 'search', 144, 10);
   EdSearch := TEdit.Create(Self);
   EdSearch.Parent := PnlTop;
-  EdSearch.SetBounds(118, 7, 220, 26);
+  EdSearch.SetBounds(168, 7, 220, 26);
   EdSearch.TextHint := 'Search folders';
   EdSearch.OnChange := @SearchChange;
-  ChkStar := TCheckBox.Create(Self);
+  ChkStar := TSpeedButton.Create(Self);
   ChkStar.Parent := PnlTop;
-  ChkStar.SetBounds(350, 10, 90, 22);
+  ChkStar.SetBounds(398, 6, 96, 28);
   ChkStar.Caption := 'Starred';
-  ChkStar.Font.Color := clPzHeader;
-  ChkStar.OnChange := @StarChange;
+  ChkStar.Hint := 'Show starred photos only';
+  ChkStar.ShowHint := True;
+  ChkStar.GroupIndex := 1;
+  ChkStar.AllowAllUp := True;
+  ChkStar.Spacing := 4;
+  PzSetGlyph(ChkStar, 'star');
+  ChkStar.OnClick := @StarChange;
   ChkRawPreview := TCheckBox.Create(Self);
   ChkRawPreview.Parent := PnlTop;
-  ChkRawPreview.SetBounds(440, 10, 200, 22);
+  ChkRawPreview.SetBounds(506, 10, 200, 22);
   ChkRawPreview.Caption := 'RAW: use camera preview';
   ChkRawPreview.Font.Color := clPzHeader;
   ChkRawPreview.Checked := Settings.ReadBool('view', 'rawpreview', True);
   ChkRawPreview.OnChange := @RawModeChange;
-  L := TLabel.Create(Self);
-  L.Parent := PnlTop;
-  L.SetBounds(650, 12, 40, 20);
-  L.Caption := 'Size';
-  L.Font.Color := clPzHeader;
+  ImgSize := AddIcon(PnlTop, 'thumbsize', 716, 10);
+  ImgSize.Hint := 'Thumbnail size';
+  ImgSize.ShowHint := True;
+  L := nil;
   TrkSize := TTrackBar.Create(Self);
   TrkSize.Parent := PnlTop;
-  TrkSize.SetBounds(690, 4, 180, 32);
+  TrkSize.SetBounds(740, 4, 180, 32);
   TrkSize.Min := 64;
   TrkSize.Max := 320;
   TrkSize.Frequency := 32;
@@ -373,7 +384,7 @@ begin
   TrkSize.TabStop := False;
   LblStatus := TLabel.Create(Self);
   LblStatus.Parent := PnlTop;
-  LblStatus.SetBounds(890, 12, 500, 20);
+  LblStatus.SetBounds(936, 12, 500, 20);
   LblStatus.Font.Color := clPzSub;
 
   PnlLibrary := TPanel.Create(Self);
@@ -424,14 +435,38 @@ begin
 end;
 
 function TMainForm.AddButton(AParent: TWinControl; const ACaption: string;
-  X, Y, W: Integer; Handler: TNotifyEvent): TButton;
+  X, Y, W: Integer; Handler: TNotifyEvent; const AIcon: string): TBitBtn;
 begin
-  Result := TButton.Create(Self);
+  Result := TBitBtn.Create(Self);
   Result.Parent := AParent;
   Result.SetBounds(X, Y, W, 28);
   Result.Caption := ACaption;
   Result.OnClick := Handler;
   Result.TabStop := False;
+  if AIcon <> '' then
+  begin
+    PzSetGlyph(Result, AIcon);
+    Result.Spacing := 4;
+    Result.Margin := IfThen(ACaption = '', -1, 4);
+  end;
+end;
+
+function TMainForm.AddIcon(AParent: TWinControl; const AIcon: string;
+  X, Y: Integer): TImage;
+var
+  Bmp: TBitmap;
+begin
+  Result := TImage.Create(Self);
+  Result.Parent := AParent;
+  Result.SetBounds(X, Y, PzIconSize, PzIconSize);
+  Result.Transparent := True;
+  Bmp := PzIconBitmap(AIcon, PzIconSize);
+  if Bmp <> nil then
+    try
+      Result.Picture.Assign(Bmp);
+    finally
+      Bmp.Free;
+    end;
 end;
 
 function TMainForm.AddSlider(AParent: TWinControl; const ACaption: string;
@@ -463,32 +498,46 @@ procedure TMainForm.BuildEditPanel;
 var
   TS: TTabSheet;
   Y: Integer;
-  B: TButton;
+  B: TBitBtn;
 
-  procedure Eff(const Cap, Name: string; X, YY: Integer);
+  procedure Eff(const Cap, Name, Tip: string; X, YY, WW: Integer);
   var
-    BB: TButton;
+    BB: TBitBtn;
   begin
-    BB := AddButton(TS, Cap, X, YY, 112, @EffectClick);
-    BB.Hint := Name;
+    { the filter name doubles as the icon name }
+    BB := AddButton(TS, Cap, X, YY, WW, @EffectClick, Name);
+    BB.Tag := FEffNames.Add(Name);
+    BB.Hint := Tip;
+  end;
+
+  procedure TabIcon(const AIcon: string);
+  begin
+    TS.ImageIndex := PzAddToImageList(TabIcons, AIcon);
   end;
 
 begin
+  FEffNames := TStringList.Create;
   PnlEditTop := TPanel.Create(Self);
   PnlEditTop.Parent := PnlEdit;
   PnlEditTop.Align := alTop;
   PnlEditTop.Height := 40;
   PnlEditTop.BevelOuter := bvNone;
   PnlEditTop.Color := TColor($303030);
-  BtnBack := AddButton(PnlEditTop, '◀ Library', 8, 6, 96, @BackClick);
-  BtnStar := AddButton(PnlEditTop, '☆ Star', 112, 6, 70, @StarClick);
-  BtnRotL := AddButton(PnlEditTop, '⟲', 188, 6, 36, @RotLClick);
-  BtnRotR := AddButton(PnlEditTop, '⟳', 228, 6, 36, @RotRClick);
-  BtnZoom := AddButton(PnlEditTop, '1:1', 270, 6, 44, @ZoomClick);
-  BtnExport := AddButton(PnlEditTop, 'Export…', 320, 6, 80, @ExportClick);
+  BtnBack := AddButton(PnlEditTop, 'Library', 8, 6, 100, @BackClick, 'library');
+  BtnBack.Hint := 'Back to the library (Esc)';
+  BtnStar := AddButton(PnlEditTop, 'Star', 114, 6, 96, @StarClick, 'star');
+  BtnStar.Hint := 'Star this photo (Ctrl+8)';
+  BtnRotL := AddButton(PnlEditTop, '', 216, 6, 34, @RotLClick, 'rotleft');
+  BtnRotL.Hint := 'Rotate counter-clockwise (Ctrl+[)';
+  BtnRotR := AddButton(PnlEditTop, '', 254, 6, 34, @RotRClick, 'rotright');
+  BtnRotR.Hint := 'Rotate clockwise (Ctrl+])';
+  BtnZoom := AddButton(PnlEditTop, '1:1', 296, 6, 64, @ZoomClick, 'zoom100');
+  BtnZoom.Hint := 'Actual pixels (1)';
+  BtnExport := AddButton(PnlEditTop, 'Export…', 366, 6, 100, @ExportClick, 'export');
+  BtnExport.Hint := 'Save an edited copy as JPEG';
   LblName := TLabel.Create(Self);
   LblName.Parent := PnlEditTop;
-  LblName.SetBounds(420, 12, 900, 20);
+  LblName.SetBounds(482, 12, 900, 20);
   LblName.Font.Color := clPzHeader;
 
   PnlTools := TPanel.Create(Self);
@@ -497,20 +546,29 @@ begin
   PnlTools.Width := 262;
   PnlTools.BevelOuter := bvNone;
 
-  BtnUndo := AddButton(PnlTools, 'Undo', 6, 4, 80, @UndoClick);
-  BtnRedo := AddButton(PnlTools, 'Redo', 90, 4, 80, @RedoClick);
-  BtnUndoAll := AddButton(PnlTools, 'Undo all', 174, 4, 82, @UndoAllClick);
+  BtnUndo := AddButton(PnlTools, 'Undo', 6, 4, 80, @UndoClick, 'undo');
+  BtnUndo.Hint := 'Undo the last edit (Ctrl+Z)';
+  BtnRedo := AddButton(PnlTools, 'Redo', 90, 4, 80, @RedoClick, 'redo');
+  BtnRedo.Hint := 'Redo (Ctrl+Y)';
+  BtnUndoAll := AddButton(PnlTools, 'All', 174, 4, 82, @UndoAllClick, 'undoall');
+  BtnUndoAll.Hint := 'Undo all edits of this photo';
+  PnlEdit.ShowHint := True;
+  TabIcons := TImageList.Create(Self);
+  TabIcons.Width := PzIconSize;
+  TabIcons.Height := PzIconSize;
 
   Pages := TPageControl.Create(Self);
   Pages.Parent := PnlTools;
   Pages.SetBounds(0, 38, 262, 560);
   Pages.Anchors := [akLeft, akTop, akRight, akBottom];
   Pages.TabStop := False;
+  Pages.Images := TabIcons;
 
   { Basic fixes }
   TS := Pages.AddTabSheet;
   TS.Caption := 'Basic';
-  BtnCrop := AddButton(TS, 'Crop', 8, 8, 112, @CropClick);
+  TabIcon('tab_basic');
+  BtnCrop := AddButton(TS, 'Crop', 8, 8, 112, @CropClick, 'crop');
   CmbAspect := TComboBox.Create(Self);
   CmbAspect.Parent := TS;
   CmbAspect.SetBounds(128, 8, 116, 28);
@@ -519,26 +577,30 @@ begin
   CmbAspect.ItemIndex := 0;
   CmbAspect.OnChange := @AspectChange;
   CmbAspect.TabStop := False;
-  BtnCropApply := AddButton(TS, 'Apply crop', 8, 40, 112, @CropApplyClick);
-  BtnCropCancel := AddButton(TS, 'Cancel', 128, 40, 116, @CropCancelClick);
+  BtnCropApply := AddButton(TS, 'Apply', 8, 40, 112, @CropApplyClick, 'apply');
+  BtnCropApply.Hint := 'Apply the crop (Enter)';
+  BtnCropCancel := AddButton(TS, 'Cancel', 128, 40, 116, @CropCancelClick, 'cancel');
   BtnCropApply.Enabled := False;
   BtnCropCancel.Enabled := False;
-  Eff('I''m Feeling Lucky', 'enhance', 8, 78);
-  Eff('Auto Contrast', 'autolight', 8, 110);
-  Eff('Auto Color', 'autocolor', 128, 110);
-  Y := 150;
+  Eff('I''m Feeling Lucky', 'enhance', 'Automatic contrast and colour in one click',
+    8, 78, 236);
+  Eff('Auto Contrast', 'autolight', 'Stretch the brightness range', 8, 110, 236);
+  Eff('Auto Color', 'autocolor', 'Remove a colour cast', 8, 142, 236);
+  Y := 182;
   AddSlider(TS, 'Straighten', -100, 100, skTilt, Y);
   AddSlider(TS, 'Fill Light', 0, 100, skFill, Y);
 
   { Tuning }
   TS := Pages.AddTabSheet;
   TS.Caption := 'Tuning';
+  TabIcon('tab_tuning');
   Y := 8;
   AddSlider(TS, 'Fill Light', 0, 100, skTFill, Y);
   AddSlider(TS, 'Highlights', 0, 100, skTHigh, Y);
   AddSlider(TS, 'Shadows', 0, 100, skTShadow, Y);
   AddSlider(TS, 'Color Temperature', -100, 100, skTTemp, Y);
-  BtnPick := AddButton(TS, 'Neutral Color Picker', 8, Y, 236, @PickClick);
+  BtnPick := AddButton(TS, 'Neutral Color Picker', 8, Y, 236, @PickClick, 'picker');
+  BtnPick.Hint := 'Click something that should be grey or white';
   Inc(Y, 40);
   AddSlider(TS, 'Brightness', -100, 100, skBright, Y);
   AddSlider(TS, 'Contrast', -100, 100, skContrast, Y);
@@ -546,9 +608,10 @@ begin
   { Effects }
   TS := Pages.AddTabSheet;
   TS.Caption := 'Effects';
-  Eff('Black && White', 'bw', 8, 8);
-  Eff('Sepia', 'sepia', 128, 8);
-  Eff('Warmify', 'warm', 8, 40);
+  TabIcon('tab_effects');
+  Eff('Black && White', 'bw', 'Convert to black and white', 8, 8, 116);
+  Eff('Sepia', 'sepia', 'Old-photo brown tone', 128, 8, 116);
+  Eff('Warmify', 'warm', 'Warmer colours', 8, 40, 116);
   Y := 80;
   AddSlider(TS, 'Sharpen', 0, 100, skSharpen, Y);
   AddSlider(TS, 'Saturation', 0, 100, skSat, Y);
@@ -742,7 +805,7 @@ end;
 
 procedure TMainForm.StarChange(Sender: TObject);
 begin
-  Grid.StarOnly := ChkStar.Checked;
+  Grid.StarOnly := ChkStar.Down;
 end;
 
 procedure TMainForm.RawModeChange(Sender: TObject);
@@ -934,9 +997,9 @@ begin
   BtnCropCancel.Enabled := False;
   P.Folder.EnsureIni;
   LblName.Caption := Format('%s    %s', [P.Name, P.Folder.Path]);
-  if P.Star then BtnStar.Caption := '★ Star'
+  if P.Star then BtnStar.Caption := 'Starred'
   else
-    BtnStar.Caption := '☆ Star';
+    BtnStar.Caption := 'Star';
   Strip.SetCurrent(P);
   LoadSlidersFromChain;
   { drop stale prefetches, keep only what's useful now }
@@ -1215,7 +1278,7 @@ end;
 
 procedure TMainForm.EffectClick(Sender: TObject);
 begin
-  AppendFilter(TButton(Sender).Hint, []);
+  AppendFilter(FEffNames[TControl(Sender).Tag], []);
 end;
 
 procedure TMainForm.CropClick(Sender: TObject);
@@ -1405,9 +1468,9 @@ begin
   P.Star := not P.Star;
   EditsChanged(P);
   if P = Cur then
-    if P.Star then BtnStar.Caption := '★ Star'
+    if P.Star then BtnStar.Caption := 'Starred'
     else
-      BtnStar.Caption := '☆ Star';
+      BtnStar.Caption := 'Star';
   Strip.Invalidate;
 end;
 
