@@ -224,6 +224,30 @@ begin
   if CacheFind(P, 3) <> nil then
     BLog(Format('      full-res size %dx%d', [CacheFind(P, 3).Img.w, CacheFind(P, 3).Img.h]));
   TimeRender('stack at 100% (full res)');
+  { panning at 1:1: what a drag costs per frame }
+  Tot := 0;
+  Mx := 0;
+  for v := 0 to 19 do
+  begin
+    Viewer.SetZoomCenter(0.2 + 0.03 * v, 0.3 + 0.02 * v);
+    T0 := NowSeconds;
+    Application.ProcessMessages; // the expose event: the real paint
+    gdk_flush;                   // and wait for the X server to draw it
+    T0 := (NowSeconds - T0) * 1000;
+    Tot := Tot + T0;
+    Mx := Max(Mx, T0);
+  end;
+  BLog(Format('    pan at 100%% (paint)          mean %6.1f ms  max %6.1f ms  (20 frames)', [Tot / 20, Mx]));
+  P.Filters := '';
+  TimeRender('no edits at 100% (full res)');
+  T0 := NowSeconds;
+  ZoomClick(nil);
+  Application.ProcessMessages;
+  gdk_flush;
+  ZoomClick(nil);
+  Application.ProcessMessages; // the first 1:1 paint
+  gdk_flush;
+  BLog(Format('    1:1 -> fit -> 1:1 (cached)    %7.1f ms', [(NowSeconds - T0) * 1000]));
   Viewer.Zoom100 := False;
   P.Filters := OrigF;
   P.Redo := OrigR;
@@ -389,11 +413,15 @@ begin
   { 7. editing }
   BLog('editing:');
   F := FindFolder(Lib, 'K5', 25, 1);
+  if F = nil then
+    F := FindFolder(Lib, '', 4, 1); // a small test library
   if F <> nil then
     BenchEdit(F.Photo(3));
   F := FindFolder(Lib, 'Pixel7', 25, 0);
   if F = nil then
     F := FindFolder(Lib, '', 25, 0);
+  if F = nil then
+    F := FindFolder(Lib, '', 4, 0);
   if F <> nil then
     BenchEdit(F.Photo(3));
   { 8. full-resolution export (decode + chain + JPEG q92) }

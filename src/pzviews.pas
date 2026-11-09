@@ -132,6 +132,24 @@ type
     FOnNav: TNotifyEvent;
     FInfo: string;
     FShowGrid: Boolean;
+    { 1:1 is drawn from tiles cut out of the rendered image on demand, so
+      only what is on screen goes to the X server: a whole 16 MP bitmap costs
+      0.7 s to upload over a remote display (x2go/NX), a tile ~1.5 ms }
+    FZImg: Tpz_image;        // the image shown at 1:1 (owned); may be a preview
+    FZW, FZH: Integer;       // its size at 1:1 (> FZImg's size for a preview)
+    FTiles: array of TBitmap;
+    FTileUse: array of Int64;
+    FTileCols, FTileRows, FTileCount: Integer;
+    FTileClock: Int64;
+    FTmrTiles: TTimer;
+    function HasZoomImage: Boolean;
+    function ZoomW: Integer;
+    function ZoomH: Integer;
+    procedure ClearTiles;
+    function GetTile(tx, ty: Integer): TBitmap;
+    function MakeTile(tx, ty: Integer): TBitmap;
+    procedure VisibleTiles(out tx0, ty0, tx1, ty1: Integer);
+    procedure TilesTimer(Sender: TObject);
     procedure SetZoom100(AValue: Boolean);
     procedure SetShowGrid(AValue: Boolean);
     function ImageRect: TRect;
@@ -150,6 +168,10 @@ type
     procedure SetZoomCenter(U, V: Double);
     function FitPointToImage(X, Y: Integer; out U, V: Double): Boolean;
     procedure SetImage(B: TBitmap);   // takes ownership
+    { the 1:1 image, shown at LW x LH (larger: an enlarged preview); takes
+      ownership of Img's pixels }
+    procedure SetZoomImage(var Img: Tpz_image; LW, LH: Integer);
+    procedure ClearZoomImage;
     procedure SetPlaceholder(B: TBitmap);
     procedure SetMode(M: TPzViewMode);
     function CropRectNorm(out L, T, R, B: Double): Boolean;
@@ -1129,12 +1151,195 @@ begin
   FZoomV := 0.5;
   FHandCursor := crHandPoint;
   FGrabCursor := crSizeAll;
+  FTmrTiles := TTimer.Create(Self);
+  FTmrTiles.Enabled := False;
+  FTmrTiles.Interval := 10;
+  FTmrTiles.OnTimer := @TilesTimer;
 end;
 
 destructor TPzViewer.Destroy;
 begin
+  ClearZoomImage;
   FBmp.Free;
   inherited Destroy;
+end;
+
+const
+  ZTILE = 256;      // tile edge at 1:1
+  ZMAX_TILES = 200; // ~50 MB of server pixmaps at most
+  ZPREFETCH = 2;    // tiles around the view uploaded while idle
+
+function TPzViewer.HasZoomImage: Boolean;
+begin
+  Result := FZoom100 and (FZImg.px <> nil);
+end;
+
+function TPzViewer.ZoomW: Integer;
+begin
+  if HasZoomImage then
+    Result := FZW
+  else if FBmp <> nil then
+    Result := FBmp.Width
+  else
+    Result := 0;
+end;
+
+function TPzViewer.ZoomH: Integer;
+begin
+  if HasZoomImage then
+    Result := FZH
+  else if FBmp <> nil then
+    Result := FBmp.Height
+  else
+    Result := 0;
+end;
+
+procedure TPzViewer.ClearTiles;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FTiles) do
+    FTiles[i].Free;
+  FTiles := nil;
+  FTileUse := nil;
+  FTileCount := 0;
+  FTmrTiles.Enabled := False;
+end;
+
+procedure TPzViewer.SetZoomImage(var Img: Tpz_image; LW, LH: Integer);
+begin
+  ClearTiles;
+  pz_free(@FZImg);
+  FZImg := Img;
+  Img.px := nil;
+  Img.w := 0;
+  Img.h := 0;
+  FZW := Max(1, LW);
+  FZH := Max(1, LH);
+  FTileCols := (FZW + ZTILE - 1) div ZTILE;
+  FTileRows := (FZH + ZTILE - 1) div ZTILE;
+  SetLength(FTiles, FTileCols * FTileRows);
+  SetLength(FTileUse, FTileCols * FTileRows);
+  Invalidate;
+end;
+
+procedure TPzViewer.ClearZoomImage;
+begin
+  ClearTiles;
+  pz_free(@FZImg);
+end;
+
+function TPzViewer.MakeTile(tx, ty: Integer): TBitmap;
+var
+  x0, y0, w, h, r, sx0, sy0, sw, sh: Integer;
+  T, T2: Tpz_image;
+  fx, fy: Double;
+begin
+  x0 := tx * ZTILE;
+  y0 := ty * ZTILE;
+  w := Min(ZTILE, FZW - x0);
+  h := Min(ZTILE, FZH - y0);
+  if (FZW = FZImg.w) and (FZH = FZImg.h) then
+  begin
+    { full resolution: copy the tile's rows out }
+    sx0 := x0;
+    sy0 := y0;
+    sw := w;
+    sh := h;
+  end
+  else
+  begin
+    { an enlarged preview while the full image decodes }
+    fx := FZImg.w / FZW;
+    fy := FZImg.h / FZH;
+    sx0 := EnsureRange(Floor(x0 * fx), 0, FZImg.w - 1);
+    sy0 := EnsureRange(Floor(y0 * fy), 0, FZImg.h - 1);
+    sw := EnsureRange(Ceil((x0 + w) * fx) - sx0, 1, FZImg.w - sx0);
+    sh := EnsureRange(Ceil((y0 + h) * fy) - sy0, 1, FZImg.h - sy0);
+  end;
+  PzInit(T);
+  if pz_alloc(@T, sw, sh) <> 0 then
+    Exit(TBitmap.Create);
+  for r := 0 to sh - 1 do
+    Move(FZImg.px[PtrUInt(sy0 + r) * PtrUInt(FZImg.w) + PtrUInt(sx0)],
+      T.px[PtrUInt(r) * PtrUInt(sw)], sw * 4);
+  if (sw <> w) or (sh <> h) then
+  begin
+    PzInit(T2);
+    if pz_resize(@T, w, h, @T2) = 0 then
+    begin
+      pz_free(@T);
+      T := T2;
+    end;
+  end;
+  Result := ImageToBitmap(T);
+  pz_free(@T);
+end;
+
+function TPzViewer.GetTile(tx, ty: Integer): TBitmap;
+var
+  i, k, Oldest: Integer;
+begin
+  i := ty * FTileCols + tx;
+  Inc(FTileClock);
+  FTileUse[i] := FTileClock;
+  if FTiles[i] = nil then
+  begin
+    { keep the server-side memory bounded: drop the least recently used }
+    while FTileCount >= ZMAX_TILES do
+    begin
+      Oldest := -1;
+      for k := 0 to High(FTiles) do
+        if (FTiles[k] <> nil) and ((Oldest < 0) or (FTileUse[k] < FTileUse[Oldest])) then
+          Oldest := k;
+      if Oldest < 0 then
+        Break;
+      FreeAndNil(FTiles[Oldest]);
+      Dec(FTileCount);
+    end;
+    FTiles[i] := MakeTile(tx, ty);
+    Inc(FTileCount);
+  end;
+  Result := FTiles[i];
+end;
+
+procedure TPzViewer.VisibleTiles(out tx0, ty0, tx1, ty1: Integer);
+var
+  R: TRect;
+begin
+  R := ImageRect;
+  tx0 := Max(0, (-R.Left) div ZTILE);
+  ty0 := Max(0, (-R.Top) div ZTILE);
+  tx1 := Min(FTileCols - 1, (ClientWidth - 1 - R.Left) div ZTILE);
+  ty1 := Min(FTileRows - 1, (ClientHeight - 1 - R.Top) div ZTILE);
+end;
+
+{ while idle, upload the tiles just outside the view, nearest first, so a
+  drag finds them ready }
+procedure TPzViewer.TilesTimer(Sender: TObject);
+var
+  tx0, ty0, tx1, ty1, tx, ty, ring, n: Integer;
+begin
+  if not HasZoomImage or (FTileCount >= ZMAX_TILES - 8) then
+  begin
+    FTmrTiles.Enabled := False;
+    Exit;
+  end;
+  VisibleTiles(tx0, ty0, tx1, ty1);
+  n := 0;
+  for ring := 1 to ZPREFETCH do
+    for ty := Max(0, ty0 - ring) to Min(FTileRows - 1, ty1 + ring) do
+      for tx := Max(0, tx0 - ring) to Min(FTileCols - 1, tx1 + ring) do
+        if (FTiles[ty * FTileCols + tx] = nil) then
+        begin
+          FTiles[ty * FTileCols + tx] := MakeTile(tx, ty);
+          FTileUse[ty * FTileCols + tx] := FTileClock;
+          Inc(FTileCount);
+          Inc(n);
+          if n >= 3 then
+            Exit; // a few per tick keeps the UI responsive
+        end;
+  FTmrTiles.Enabled := False; // all around the view are ready
 end;
 
 procedure TPzViewer.SetImage(B: TBitmap);
@@ -1174,6 +1379,8 @@ end;
 procedure TPzViewer.SetZoom100(AValue: Boolean);
 begin
   FZoom100 := AValue;
+  if not AValue then
+    ClearZoomImage;
   FDragging := False;
   if FMode = vmNormal then
     if AValue then
@@ -1212,13 +1419,13 @@ begin
   B := FBmp;
   if B = nil then
     B := FPlaceholder;
-  if (B = nil) or (B.Width = 0) then
+  if not HasZoomImage and ((B = nil) or (B.Width = 0)) then
     Exit(Rect(0, 0, 0, 0));
-  if FZoom100 and (FBmp <> nil) then
+  if FZoom100 and (HasZoomImage or (FBmp <> nil)) then
   begin
     { 1:1, the chosen image point at the centre; never scrolled past an edge }
-    w := B.Width;
-    h := B.Height;
+    w := ZoomW;
+    h := ZoomH;
     if w <= ClientWidth then
       Result.Left := (ClientWidth - w) div 2
     else
@@ -1263,7 +1470,7 @@ var
   R, CR: TRect;
   B: TBitmap;
   sx, sy: Double;
-  gi: Integer;
+  gi, tx, ty, tx0, ty0, tx1, ty1: Integer;
 begin
   C := Canvas;
   C.Brush.Color := Color;
@@ -1271,13 +1478,25 @@ begin
   B := FBmp;
   if B = nil then
     B := FPlaceholder;
-  if B <> nil then
+  if HasZoomImage then
+  begin
+    R := ImageRect;
+    VisibleTiles(tx0, ty0, tx1, ty1);
+    for ty := ty0 to ty1 do
+      for tx := tx0 to tx1 do
+        C.Draw(R.Left + tx * ZTILE, R.Top + ty * ZTILE, GetTile(tx, ty));
+    FTmrTiles.Enabled := True;
+  end
+  else if B <> nil then
   begin
     R := ImageRect;
     if (R.Right - R.Left = B.Width) and (R.Bottom - R.Top = B.Height) then
       C.Draw(R.Left, R.Top, B)
     else
       C.StretchDraw(R, B);
+  end;
+  if (B <> nil) or HasZoomImage then
+  begin
     if FShowGrid then
     begin
       { a fine levelling grid while straightening, as Picasa shows }
@@ -1346,7 +1565,7 @@ begin
       FDragging := True;
     end;
     vmPick:
-      if (FBmp <> nil) and Assigned(FOnPick) then
+      if ((FBmp <> nil) or HasZoomImage) and Assigned(FOnPick) then
       begin
         R := ImageRect;
         if PtInRect(R, Point(X, Y)) then
@@ -1399,13 +1618,13 @@ begin
     FCropB := P;
     Invalidate;
   end
-  else if FZoom100 and (FBmp <> nil) then
+  else if FZoom100 and (ZoomW > 0) then
   begin
     if Abs(X - FDragStart.X) + Abs(Y - FDragStart.Y) > 3 then
       FMoved := True;
     { drag the photo: the hand holds the same image point }
-    FZoomU := EnsureRange(FStartU - (X - FDragStart.X) / FBmp.Width, 0, 1);
-    FZoomV := EnsureRange(FStartV - (Y - FDragStart.Y) / FBmp.Height, 0, 1);
+    FZoomU := EnsureRange(FStartU - (X - FDragStart.X) / ZoomW, 0, 1);
+    FZoomV := EnsureRange(FStartV - (Y - FDragStart.Y) / ZoomH, 0, 1);
     Invalidate;
   end;
 end;

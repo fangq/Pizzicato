@@ -10,7 +10,7 @@ interface
 uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
   LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
-  Buttons, ImgList,
+  Buttons, ImgList, gdk2,
   pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons;
 
 type
@@ -100,6 +100,8 @@ type
     BtnQuickCfg: TSpeedButton;
     Status: TStatusBar;
     TmrIni, TmrStatus: TTimer;
+    TmrFull: TTimer;       // decodes full resolution once a photo has been looked at
+    FFullReq: TPzPhoto;    // the photo whose full-resolution decode is queued
     { state }
     FEditMode: Boolean;
     Cur: TPzPhoto;
@@ -241,6 +243,8 @@ type
     procedure PickClick(Sender: TObject);
     procedure ViewerPick(Sender: TObject; NX, NY: Double);
     procedure TmrIniTimer(Sender: TObject);
+    procedure TmrFullTimer(Sender: TObject);
+    procedure RequestFull(P: TPzPhoto; Front: Boolean);
     procedure TmrStatusTimer(Sender: TObject);
     procedure FormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure FormClose(Sender: TObject; var CloseAction: TCloseAction);
@@ -586,6 +590,10 @@ begin
   Viewer.OnContextPopup := @ViewerContextPopup;
   Tree.OnContextPopup := @TreeContextPopup;
 
+  TmrFull := TTimer.Create(Self);
+  TmrFull.Enabled := False;
+  TmrFull.Interval := 500;
+  TmrFull.OnTimer := @TmrFullTimer;
   TmrIni := TTimer.Create(Self);
   TmrIni.Enabled := False;
   TmrIni.Interval := 1500;
@@ -1067,6 +1075,7 @@ begin
   for i := 0 to Cache.Count - 1 do
     TViewEntry(Cache[i]).Free;
   Cache.Clear;
+  FFullReq := nil;
   if FEditMode and (Cur <> nil) then
     ShowPhoto(Cur);
 end;
@@ -1169,8 +1178,25 @@ end;
 
 procedure TMainForm.CacheTrim;
 var
-  i, Oldest: Integer;
+  i, Oldest, nFull: Integer;
 begin
+  { full-resolution images are 50-100 MB each: keep the current one and one more }
+  repeat
+    nFull := 0;
+    Oldest := -1;
+    for i := 0 to Cache.Count - 1 do
+      if TViewEntry(Cache[i]).Level = 3 then
+      begin
+        Inc(nFull);
+        if (TViewEntry(Cache[i]).Photo <> Cur) and ((Oldest < 0) or
+          (TViewEntry(Cache[i]).Stamp < TViewEntry(Cache[Oldest]).Stamp)) then
+          Oldest := i;
+      end;
+    if (nFull <= 2) or (Oldest < 0) then
+      Break;
+    TViewEntry(Cache[Oldest]).Free;
+    Cache.Delete(Oldest);
+  until False;
   while Cache.Count > 10 do
   begin
     Oldest := -1;
@@ -1250,8 +1276,12 @@ begin
     SaveCaption;
   if (Cur <> nil) and (Cur <> P) then
     Viewer.SetMode(vmNormal);
+  if Cur <> P then
+    FFullReq := nil;
   Cur := P;
   Inc(ViewToken);
+  TmrFull.Enabled := False;
+  TmrFull.Enabled := True;
   FCurLevel := 0;
   FOpenT0 := NowSeconds;
   FFirstFullMs := -1;
@@ -1324,7 +1354,7 @@ procedure TMainForm.RenderCurrent;
 var
   E: TViewEntry;
   Img, Tmp: Tpz_image;
-  T0, s: Double;
+  T0, s, f: Double;
   W, H: Integer;
   Info: string;
   HistData: Tpz_hist;
@@ -1362,15 +1392,29 @@ begin
   end;
   pz_histogram(@Img, HistData);
   Hist.SetHistogram(HistData);
-  Viewer.SetImage(ImageToBitmap(Img));
-  pz_free(@Img);
+  if Viewer.Zoom100 then
+  begin
+    { until the full-resolution decode is in, show the screen-size image
+      enlarged to the photo's real size, so 1:1 opens at once, in place }
+    f := 1;
+    if (E.Level < 3) and (Max(E.Img.w, E.Img.h) > 0) then
+      f := Max(1.0, Max(Cur.W, Cur.H) / Max(E.Img.w, E.Img.h));
+    Viewer.SetZoomImage(Img, Round(Img.w * f), Round(Img.h * f)); // takes Img
+  end
+  else
+  begin
+    Viewer.SetImage(ImageToBitmap(Img));
+    pz_free(@Img);
+  end;
   FCurLevel := E.Level;
   FLastRenderMs := (NowSeconds - T0) * 1000;
   if (E.Level >= 2) and (FFirstFullMs < 0) then
     FFirstFullMs := (NowSeconds - FOpenT0) * 1000;
   case E.Level of
     1: Info := 'embedded preview';
-    2: Info := 'screen size';
+    2: if Viewer.Zoom100 then Info := 'screen size, enlarged until full resolution is in'
+      else
+        Info := 'screen size';
     3: Info := 'full resolution';
   end;
   if Viewer.Zoom100 then
@@ -1457,6 +1501,23 @@ begin
   for i := 0 to FDirtyFolders.Count - 1 do
     TPzFolder(FDirtyFolders[i]).FlushIni;
   FDirtyFolders.Clear;
+end;
+
+procedure TMainForm.RequestFull(P: TPzPhoto; Front: Boolean);
+begin
+  if (P = nil) or (CacheFind(P, 3) <> nil) or (FFullReq = P) then
+    Exit;
+  FFullReq := P;
+  Lib.RequestView(P, 0, 0, RawFlags or PZ_RAW_FULL, -1, Front);
+end;
+
+{ like Picasa: after half a second on a photo, its full resolution is
+  decoded in the background, so 1:1 then opens at once }
+procedure TMainForm.TmrFullTimer(Sender: TObject);
+begin
+  TmrFull.Enabled := False;
+  if FEditMode and not FBench and (Cur <> nil) and (CacheFind(Cur, 2) <> nil) then
+    RequestFull(Cur, False);
 end;
 
 procedure TMainForm.TmrIniTimer(Sender: TObject);
@@ -1797,8 +1858,8 @@ begin
   if not Viewer.Zoom100 and (Sender <> Viewer) then
     Viewer.SetZoomCenter(0.5, 0.5);
   Viewer.Zoom100 := not Viewer.Zoom100;
-  if Viewer.Zoom100 and (CacheFind(Cur, 3) = nil) then
-    Lib.RequestView(Cur, 0, 0, RawFlags or PZ_RAW_FULL, -1, True);
+  if Viewer.Zoom100 then
+    RequestFull(Cur, True);
   RenderCurrent;
 end;
 

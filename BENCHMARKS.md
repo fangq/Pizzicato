@@ -58,6 +58,26 @@ The table measures the LibRaw frame.
 | 100% zoom: 6-filter stack at full resolution | 166 ms | 108 ms |
 | Export at full resolution (decode + 3 filters + JPEG q92) | 179 ms | 124 ms |
 
+### 1:1 view on a remote display
+
+At 1:1 the viewer no longer sends the whole photo to the X server. It cuts
+the rendered image into 256 px tiles and sends only the ones on screen, and
+uploads the tiles around the view while idle. Measured on the x2go (nxagent)
+display this machine is used from, against a local Xvfb:
+
+| X upload | x2go display | local Xvfb |
+|---|---|---|
+| Whole 4928×3264 image (64 MB): what entering 1:1 used to cost | 725–7,300 ms | 13 ms |
+| A screenful of tiles (35 × 256²) | 108–118 ms | ~2 ms |
+| Panning one frame (copying tiles already on the server) | 0.1 ms | 0.1–0.2 ms |
+
+Edits made at 1:1 re-render without the whole-image upload too. A 1:1 render
+with no edits fell from 29–31 ms to 13–17 ms on Xvfb, because the 16 MP bitmap
+conversion is gone. 1:1 opens at once: until the full-resolution decode
+(150–220 ms) is in, the screen-size image is shown enlarged in place. After
+half a second on a photo the editor decodes its full resolution in the
+background, as Picasa does. At most two full-resolution images are cached.
+
 ## Correctness checks
 
 * All 260 `.picasa.ini` files in the library round-trip **byte-for-byte**
