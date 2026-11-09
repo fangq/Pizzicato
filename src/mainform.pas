@@ -123,6 +123,15 @@ type
     FAIMsg, FBaseInfo: string;
     PnlDenoise: TPanel;
     ChkDenoiseHQ: TCheckBox;
+    { Remove: SAM selection, then LaMa }
+    PnlRemove: TPanel;
+    LblRemove: TLabel;
+    FRemoveMode: Boolean;
+    FSam: TPzSam;
+    FRmPts: array of Single;
+    FRmLab: array of Integer;
+    FRmMask: TBytes;
+    FRmW, FRmH: Integer;
   private
     procedure AIDone(J: TPzAIJob);
     procedure AIProgress(ATag: Pointer; Done, Total: Integer);
@@ -133,6 +142,10 @@ type
     procedure DenoiseOffClick(Sender: TObject);
     procedure DenoiseHQClick(Sender: TObject);
     procedure SetDenoise(AOn: Boolean; Amount: Double; HQ: Boolean);
+    procedure RemoveTileClick(Sender: TObject);
+    procedure RemoveApplyClick(Sender: TObject);
+    procedure RemoveCancelClick(Sender: TObject);
+    procedure RemovePick(NX, NY: Double);
     procedure SmartClick(Sender: TObject);
     procedure TmrSmartTimer(Sender: TObject);
     procedure SmartSearch;
@@ -840,6 +853,9 @@ begin
   EffTile(P, 'Auto Color', 'autocolor', 'Remove a colour cast', 86, 80);
   AddTile(P, 'AI Denoise', 'denoise', 'Remove noise with a neural network (GPU)',
     168, 80, @DenoiseTileClick);
+  P.Height := 232;
+  AddTile(P, 'Remove', 'remove', 'Remove a person or a thing: click it, then Remove',
+    4, 156, @RemoveTileClick);
 
   PnlCropOpts := TPanel.Create(Self);
   PnlCropOpts.Parent := TS;
@@ -863,6 +879,24 @@ begin
   BtnCropCancel := AddButton(PnlCropOpts, 'Cancel', 128, 40, 116,
     @CropCancelClick, 'cancel');
   BtnCrop := BtnCropApply; // kept for older code paths
+
+  PnlRemove := TPanel.Create(Self);
+  PnlRemove.Parent := TS;
+  PnlRemove.Align := alTop;
+  PnlRemove.Top := 1000;
+  PnlRemove.Height := 100;
+  PnlRemove.BevelOuter := bvNone;
+  PnlRemove.ParentColor := True;
+  PnlRemove.Visible := False;
+  LblRemove := TLabel.Create(Self);
+  LblRemove.Parent := PnlRemove;
+  LblRemove.SetBounds(8, 4, 236, 50);
+  LblRemove.WordWrap := True;
+  LblRemove.AutoSize := False;
+  LblRemove.Font.Color := clPzHeader;
+  AddButton(PnlRemove, 'Remove', 8, 58, 112, @RemoveApplyClick, 'remove').Hint :=
+    'Remove what is selected (red)';
+  AddButton(PnlRemove, 'Cancel', 128, 58, 116, @RemoveCancelClick, 'cancel');
 
   PnlDenoise := TPanel.Create(Self);
   PnlDenoise.Parent := TS;
@@ -1700,6 +1734,8 @@ begin
   if Cur <> P then
   begin
     FFullReq := nil;
+    if FRemoveMode then
+      RemoveCancelClick(nil);
     if AIWorker <> nil then
       AIWorker.CancelOthers(P);
   end;
@@ -1787,6 +1823,8 @@ var
   DKind: TPzAIKind;
   DKey, DWhy: string;
   DJob: TPzAIJob;
+  RSteps: TStringArray;
+  k: Integer;
 begin
   if Cur = nil then
     Exit;
@@ -1838,6 +1876,55 @@ begin
     else
       FAIMsg := '  ·  AI denoise unavailable';
   end;
+  { AI removals, in order, each from the cache or queued }
+  RSteps := RemoveSteps(Cur.Filters);
+  if (Length(RSteps) > 0) and (E.Level >= 2) then
+  begin
+    DKey := AIKey(Cur, akRemove, E.Img.w, E.Img.h);
+    if DenoiseOf(Cur.Filters, DAmt, DKind) then
+      DKey := DKey + '|d' + FmtF(DAmt) + IntToStr(Ord(DKind));
+    for k := 0 to High(RSteps) do
+    begin
+      DKey := DKey + '|r' + RSteps[k];
+      DJob := AIFind(DKey);
+      if DJob <> nil then
+      begin
+        pz_free(@Img);
+        pz_copy(@DJob.Img, @Img);
+        Continue;
+      end;
+      if PzAIReady(akRemove, DWhy) then
+      begin
+        if AIWorker = nil then
+        begin
+          AIWorker := TPzAIWorker.Create;
+          AIWorker.OnDone := @AIDone;
+          AIWorker.OnProgress := @AIProgress;
+        end;
+        if not AIWorker.Pending(DKey) then
+        begin
+          DJob := TPzAIJob.Create;
+          DJob.Kind := akRemove;
+          DJob.Key := DKey;
+          DJob.Tag := Cur;
+          DJob.MaskFile := PzMaskPath(Cur.Path, StrToIntDef(RSteps[k], 0));
+          DJob.CachePath := FAIDir + '/' + MD5Print(MD5String(DKey)) + '.jpg';
+          pz_copy(@Img, @DJob.Img);
+          AIWorker.Submit(DJob);
+        end;
+        FAIMsg := FAIMsg + '  ·  AI remove…';
+      end;
+      Break;
+    end;
+  end;
+  { the selection while removing: red over the subject }
+  if FRemoveMode and (FRmMask <> nil) and (FRmW > 0) and (FRmH > 0) then
+    for k := 0 to Img.w * Img.h - 1 do
+      if FRmMask[((k div Img.w) * FRmH div Img.h) * FRmW + (k mod Img.w) *
+        FRmW div Img.w] <> 0 then
+        Img.px[k] := (Img.px[k] and $FF000000) or
+          (((((Img.px[k] shr 16) and 255) + 255) shr 1) shl 16) or
+          ((((Img.px[k] shr 8) and 255) shr 1) shl 8) or ((Img.px[k] and 255) shr 1);
   RenderChain(Img, ParseChain(Cur.Filters), Cur.Rotate);
   if not Viewer.Zoom100 then
   begin
@@ -2004,6 +2091,167 @@ begin
     SetDenoise(True, 0.8, False)
   else
     LoadSlidersFromChain;
+end;
+
+procedure TMainForm.RemoveTileClick(Sender: TObject);
+var
+  Why: string;
+begin
+  if Cur = nil then
+    Exit;
+  if not PzAIReady(akRemove, Why) then
+  begin
+    MessageDlg('Remove', Why, mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if ChainHasGeometry(ParseChain(Cur.Filters)) then
+  begin
+    MessageDlg('Remove', 'Remove works on the uncropped, unstraightened photo: ' +
+      'undo the crop or straighten first, then crop again afterwards.',
+      mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  FRemoveMode := True;
+  FRmPts := nil;
+  FRmLab := nil;
+  FRmMask := nil;
+  Viewer.Zoom100 := False;
+  Viewer.SetMode(vmPick);
+  LblRemove.Caption :=
+    'Click what to remove. Click again to add to it, Shift+click to keep a part.';
+  PnlRemove.Visible := True;
+end;
+
+{ a click while removing: one more SAM point, in the camera image's frame }
+procedure TMainForm.RemovePick(NX, NY: Double);
+var
+  E: TViewEntry;
+  U, V, BX, BY: Double;
+  n: Integer;
+begin
+  { the screen-size image: SAM works at 1024 px anyway }
+  E := nil;
+  for n := 0 to Cache.Count - 1 do
+    if (TViewEntry(Cache[n]).Photo = Cur) and (TViewEntry(Cache[n]).Level = 2) then
+      E := TViewEntry(Cache[n]);
+  if E = nil then
+    E := CacheFind(Cur, 1);
+  if E = nil then
+    Exit;
+  if Length(FRmLab) >= 5 then
+  begin
+    LblRemove.Caption := 'At most 5 clicks: Remove, or Cancel and start again.';
+    Exit;
+  end;
+  { undo the photo's quarter turns }
+  U := NX;
+  V := NY;
+  case ((Cur.Rotate mod 4) + 4) mod 4 of
+    1: begin
+      BX := V;
+      BY := 1 - U;
+    end;
+    2: begin
+      BX := 1 - U;
+      BY := 1 - V;
+    end;
+    3: begin
+      BX := 1 - V;
+      BY := U;
+    end;
+    else
+    begin
+      BX := U;
+      BY := V;
+    end;
+  end;
+  if FSam = nil then
+    FSam := TPzSam.Create;
+  Screen.Cursor := crHourGlass;
+  try
+    if not FSam.Embed(AIKey(Cur, akRemove, E.Img.w, E.Img.h), E.Img) then
+    begin
+      Screen.Cursor := crDefault;
+      MessageDlg('Remove', FSam.Error, mtInformation, [mbOK], 0);
+      RemoveCancelClick(nil);
+      Exit;
+    end;
+    n := Length(FRmLab);
+    SetLength(FRmLab, n + 1);
+    SetLength(FRmPts, 2 * (n + 1));
+    FRmPts[2 * n] := BX * E.Img.w;
+    FRmPts[2 * n + 1] := BY * E.Img.h;
+    if GetKeyState(VK_SHIFT) < 0 then
+      FRmLab[n] := 0
+    else
+      FRmLab[n] := 1;
+    if FSam.Mask(FRmPts, FRmLab, FRmMask) then
+    begin
+      FRmW := FSam.W;
+      FRmH := FSam.H;
+    end;
+  finally
+    Screen.Cursor := crDefault;
+  end;
+  LblRemove.Caption := Format('%d click(s). Remove takes the red part out.', [n + 1]);
+  RenderCurrent;
+end;
+
+procedure TMainForm.RemoveApplyClick(Sender: TObject);
+var
+  C: TPzChain;
+  Dir, F: string;
+  k, i, At: Integer;
+begin
+  if (Cur = nil) or (FRmMask = nil) then
+  begin
+    RemoveCancelClick(nil);
+    Exit;
+  end;
+  if PzIniReadOnly then
+  begin
+    MessageDlg('Remove', 'Pizzicato is running read-only (--readonly).',
+      mtInformation, [mbOK], 0);
+    RemoveCancelClick(nil);
+    Exit;
+  end;
+  { the mask goes next to the photo, in the album's .pizzicato folder }
+  Dir := ExtractFilePath(Cur.Path) + '.pizzicato';
+  ForceDirectories(Dir);
+  k := 1;
+  while FileExists(PzMaskPath(Cur.Path, k)) do
+    Inc(k);
+  F := PzMaskPath(Cur.Path, k);
+  if pz_save_png_gray(PAnsiChar(F), FRmW, FRmH, @FRmMask[0]) <> 0 then
+  begin
+    MessageDlg('Remove', 'Cannot write ' + F, mtError, [mbOK], 0);
+    Exit;
+  end;
+  { after the chain's other AI steps, before everything else }
+  Cur.Folder.EnsureIni;
+  C := ParseChain(Cur.Filters);
+  At := 0;
+  while (At < Length(C)) and ((C[At].Name = 'pzdenoise') or (C[At].Name = 'pzremove')) do
+    Inc(At);
+  SetLength(C, Length(C) + 1);
+  for i := High(C) downto At + 1 do
+    C[i] := C[i - 1];
+  C[At] := MakeFilter('pzremove', [IntToStr(k)]);
+  Cur.Filters := ChainToString(C);
+  Cur.Redo := '';
+  RemoveCancelClick(nil);
+  EditsChanged(Cur);
+end;
+
+procedure TMainForm.RemoveCancelClick(Sender: TObject);
+begin
+  FRemoveMode := False;
+  FRmPts := nil;
+  FRmLab := nil;
+  FRmMask := nil;
+  PnlRemove.Visible := False;
+  Viewer.SetMode(vmNormal);
+  QueueRender;
 end;
 
 procedure TMainForm.DenoiseOffClick(Sender: TObject);
@@ -2335,6 +2583,11 @@ var
   px: LongWord;
   Hex: string;
 begin
+  if FRemoveMode then
+  begin
+    RemovePick(NX, NY);
+    Exit;
+  end;
   Viewer.SetMode(vmNormal);
   E := CacheFind(Cur, 1);
   if E = nil then
@@ -2500,7 +2753,7 @@ begin
   if pz_load(PAnsiChar(Path), 0, 0, Flags, @Img, @M) < 0 then
     Exit;
   try
-    PzAIApplyChain(Img, Edits, nil);
+    PzAIApplyChain(Img, Edits, Path, nil);
     RenderChain(Img, ParseChain(Edits), Rot);
     if Scale > 1 then
       PzUpscale(Img, Scale);
@@ -2754,6 +3007,7 @@ begin
   FreeAndNil(ClipIdx);
   FreeAndNil(ClipText);
   FreeAndNil(FaceIdx);
+  FreeAndNil(FSam);
   if not PnlRight.Visible then
     Settings.WriteInteger('view', 'rightpanel', 0)
   else if RightPages.ActivePage = TabTags then

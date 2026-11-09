@@ -59,6 +59,8 @@ int  pz_decode_jpeg_mem(const unsigned char* buf, unsigned long len, int maxw, i
 int  pz_encode_jpeg_mem(const pz_image* img, int quality, unsigned char** out, unsigned long* outlen);
 void pz_free_mem(void* p);
 int  pz_save_jpeg(const char* path, const pz_image* img, int quality);
+/* an 8-bit grayscale PNG (masks); 0 on success */
+int  pz_save_png_gray(const char* path, int w, int h, const unsigned char* px);
 
 /* ---- filters (all in place unless stated) ---- */
 typedef struct {

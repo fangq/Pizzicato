@@ -2682,3 +2682,40 @@ void pz_dot_i8(const int8_t* m, const float* scale, int n, int d, const float* q
         out[i] = acc * scale[i];
     }
 }
+
+int pz_save_png_gray(const char* path, int w, int h, const unsigned char* px) {
+    FILE* f = fopen(path, "wb");
+    png_structp png;
+    png_infop info;
+    int y;
+
+    if (!f) {
+        return -1;
+    }
+
+    png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    info = png ? png_create_info_struct(png) : NULL;
+
+    if (!png || !info || setjmp(png_jmpbuf(png))) {
+        if (png) {
+            png_destroy_write_struct(&png, info ? &info : NULL);
+        }
+
+        fclose(f);
+        return -1;
+    }
+
+    png_init_io(png, f);
+    png_set_IHDR(png, info, w, h, 8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    for (y = 0; y < h; y++) {
+        png_write_row(png, (png_const_bytep)(px + (size_t)y * w));
+    }
+
+    png_write_end(png, NULL);
+    png_destroy_write_struct(&png, &info);
+    fclose(f);
+    return 0;
+}

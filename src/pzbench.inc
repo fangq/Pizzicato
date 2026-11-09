@@ -333,7 +333,7 @@ begin
   if pz_load(PAnsiChar(P.Path), 0, 0, RawFlags or PZ_RAW_FULL, @Img, @M) >= 0 then
   begin
     T0 := NowSeconds;
-    PzAIApplyChain(Img, P.Filters, nil);
+    PzAIApplyChain(Img, P.Filters, P.Path, nil);
     BLog(Format('    export path (PzAIApplyChain)   %8.0f ms  %s', [(NowSeconds - T0) * 1000,
       IfThen(PzAILastError = '', 'ok', PzAILastError)]));
     pz_free(@Img);

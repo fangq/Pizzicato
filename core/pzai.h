@@ -83,6 +83,20 @@ int  pz_ai_faces(pz_ai* det, const pz_image* img, int size, float thresh, pz_fac
 /* a face's 128-d identity embedding (L2-normalised; same person: cos > ~0.36) */
 int  pz_ai_face_embed(pz_ai* rec, const pz_image* img, const pz_face* f, float* emb);
 
+/* ---- subject masks (MobileSAM) and object removal (LaMa) ---- */
+#define PZ_SAM_EMB (256 * 64 * 64)
+/* MobileSAM image encoder: img's long edge goes to 1024; emb gets
+ * PZ_SAM_EMB floats. Done once per photo. */
+int  pz_ai_sam_encode(pz_ai* enc, const pz_image* img, float* emb);
+/* the decoder: n points (x, y in img pixels; label 1 = on the subject,
+ * 0 = not) -> mask (w x h bytes, 255 = subject) for an image of w x h */
+int  pz_ai_sam_mask(pz_ai* dec, const float* emb, int w, int h, const float* pts,
+                    const int* labels, int n, unsigned char* mask);
+/* fill the masked area (mask: img.w x img.h bytes, nonzero = remove) from
+ * its surroundings: the mask's neighbourhood goes through LaMa at 512 px
+ * and the result is blended back with a soft edge. In place. */
+int  pz_ai_inpaint(pz_ai* lama, pz_image* img, const unsigned char* mask);
+
 #ifdef __cplusplus
 }
 #endif

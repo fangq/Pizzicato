@@ -66,8 +66,33 @@ model_mobilesam() { # subject selection (Apache-2.0 MobileSAM; ONNX export by Ac
         580f5fb648ea1062c0aabc26217aed56921985f03f0cbbd852bba81d760cc749
     fetch "$u/sam_mask_decoder_single.onnx" "$SRC/mobilesam/sam_mask_decoder_single.onnx" \
         93915fc7c993ab9d59ab8c9ccd3bce37f7509c81ab4150a74abd4d2abbd8570d
-    convert "$SRC/mobilesam/mobile_sam_image_encoder.onnx" mobilesam_enc.mnn
-    convert "$SRC/mobilesam/sam_mask_decoder_single.onnx" mobilesam_dec.mnn
+    # MNN mis-converts their dynamic shapes: fix them first (python3 onnx).
+    # The encoder takes 1024 x 1024 (Pizzicato pads with SAM's mean colour);
+    # the decoder is converted once per point count, 2..6 (clicks + 1 pad).
+    python3 - "$SRC/mobilesam" <<'PY'
+import sys, onnx
+d = sys.argv[1]
+m = onnx.load(d + "/mobile_sam_image_encoder.onnx")
+for k, v in enumerate([1024, 1024, 3]):
+    x = m.graph.input[0].type.tensor_type.shape.dim[k]; x.ClearField("dim_param"); x.dim_value = v
+onnx.save(m, d + "/mobile_sam_image_encoder_1024.onnx")
+for n in range(2, 7):
+    m = onnx.load(d + "/sam_mask_decoder_single.onnx")
+    for i in m.graph.input:
+        if i.name in ("point_coords", "point_labels"):
+            x = i.type.tensor_type.shape.dim[1]; x.ClearField("dim_param"); x.dim_value = n
+    onnx.save(m, d + "/sam_mask_decoder_%dpt.onnx" % n)
+PY
+    convert "$SRC/mobilesam/mobile_sam_image_encoder_1024.onnx" mobilesam_enc.mnn
+    for n in 2 3 4 5 6; do
+        convert "$SRC/mobilesam/sam_mask_decoder_${n}pt.onnx" mobilesam_dec$n.mnn
+    done
+}
+
+model_lama() { # object removal (Apache-2.0, big-lama; ONNX export by Carve)
+    fetch "$HF/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx" "$SRC/lama/lama_fp32.onnx" \
+        1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6
+    convert "$SRC/lama/lama_fp32.onnx" lama.mnn
 }
 
 model_clip() { # search by description (MIT, OpenAI CLIP ViT-B/32; ONNX export by Xenova)
@@ -93,7 +118,7 @@ model_faces() { # People: YuNet detection (MIT) and SFace recognition (Apache-2.
     convert "$SRC/face/sface.onnx" face_sface.mnn
 }
 
-ALL=(nafnet scunet esrgan mobilesam clip faces)
+ALL=(nafnet scunet esrgan mobilesam lama clip faces)
 for m in "${@:-${ALL[@]}}"; do
     "model_$m"
 done

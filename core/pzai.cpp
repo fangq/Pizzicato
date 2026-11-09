@@ -13,6 +13,8 @@
 #include <MNN/Interpreter.hpp>
 #include <MNN/MNNSharedContext.h>
 #include <MNN/Tensor.hpp>
+#include <MNN/expr/ExprCreator.hpp>
+#include <MNN/expr/Module.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -56,6 +58,10 @@ struct pz_ai {
     std::map<std::pair<std::string, std::string>, int> ranks;
     std::string byte2u[256];
     std::unordered_map<std::string, std::vector<int>> bpe_cache;
+    /* models with data-dependent shapes (SAM's decoder) run as an Express
+       Module instead of a session */
+    std::shared_ptr<MNN::Express::Module> mod[8]; /* SAM: by point count */
+    std::string dec_base;
 };
 
 extern "C" int pz_ai_available(void) {
@@ -181,13 +187,30 @@ static bool make_session(pz_ai* h, const char* model, int device, int tile, int 
 
     h->in = h->net->getSessionInput(h->sess, nullptr);
 
+    if (!h->in && tile < 0) { /* several inputs: the calls name theirs */
+        const auto& all = h->net->getSessionInputAll(h->sess);
+
+        if (!all.empty()) {
+            h->in = all.begin()->second;
+        }
+    }
+
     if (!h->in) {
+        g_err = "the model has no input";
         return false;
     }
 
     if (tile < 0) { /* an embedding model: the caller sizes the input */
         h->generic = true;
         h->out = h->net->getSessionOutput(h->sess, nullptr);
+
+        if (!h->out) {
+            const auto& all = h->net->getSessionOutputAll(h->sess);
+
+            if (!all.empty()) {
+                h->out = all.begin()->second;
+            }
+        }
         int fwd = cfg.type;
         h->net->getSessionInfo(h->sess, MNN::Interpreter::BACKENDS, &fwd);
         h->backend = fwd == MNN_FORWARD_OPENCL ? "opencl" : fwd == MNN_FORWARD_VULKAN ? "vulkan" : "cpu";
@@ -242,6 +265,28 @@ extern "C" int pz_ai_open(const char* model, int device, int tile, int threads, 
     *out = nullptr;
     g_err.clear();
     std::unique_ptr<pz_ai> h(new pz_ai());
+
+    if (tile < 0 && strstr(model, "_dec")) {
+        /* SAM's decoder, converted once per point count (MNN mis-converts
+           its dynamic shapes): <base>2.mnn .. <base>6.mnn, loaded as needed */
+        std::string b = model;
+
+        if (b.size() > 4 && b.compare(b.size() - 4, 4, ".mnn") == 0) {
+            b.resize(b.size() - 4);
+        }
+
+        h->dec_base = b;
+
+        if (access((b + "2.mnn").c_str(), R_OK) != 0) {
+            return fail("cannot find " + b + "2.mnn");
+        }
+
+        h->generic = true;
+        h->backend = "cpu";
+        *out = h.release();
+        return 0;
+    }
+
     h->net.reset(MNN::Interpreter::createFromFile(model), MNN::Interpreter::destroy);
 
     if (!h->net) {
@@ -276,6 +321,9 @@ extern "C" void pz_ai_close(pz_ai* h) {
 
     h->hin.reset();
     h->hout.reset();
+    for (auto& m : h->mod) {
+        m.reset();
+    }
 
     if (h->sess) {
         h->net->releaseSession(h->sess);
@@ -1225,4 +1273,404 @@ extern "C" int pz_ai_face_embed(pz_ai* h, const pz_image* img, const pz_face* f,
     }
 
     return run_embed(h, emb);
+}
+
+/* ---------------- SAM and LaMa ---------------- */
+
+/* fill a named input from floats (resizing it to shp first) */
+static int set_input(pz_ai* h, const char* name, const std::vector<int>& shp, const float* data,
+                     bool resize) {
+    MNN::Tensor* t = h->net->getSessionInput(h->sess, name);
+
+    if (!t) {
+        return fail(std::string("the model has no input ") + name);
+    }
+
+    if (resize) {
+        h->net->resizeTensor(t, shp);
+    }
+
+    (void)data;
+    return 0;
+}
+
+static int copy_input(pz_ai* h, const char* name, const std::vector<int>& shp, const float* data) {
+    MNN::Tensor* t = h->net->getSessionInput(h->sess, name);
+
+    if (!t) {
+        return fail(std::string("the model has no input ") + name);
+    }
+
+    std::unique_ptr<MNN::Tensor> host(MNN::Tensor::create<float>(shp, nullptr, MNN::Tensor::CAFFE));
+    size_t n = 1;
+
+    for (int d : shp) {
+        n *= d;
+    }
+
+    memcpy(host->host<float>(), data, n * sizeof(float));
+    return t->copyFromHostTensor(host.get()) ? 0 : fail("cannot upload an input");
+}
+
+static int run_resized(pz_ai* h) {
+    h->net->resizeSession(h->sess);
+    int status = 0;
+    h->net->getSessionInfo(h->sess, MNN::Interpreter::RESIZE_STATUS, &status);
+    return status == 0 ? 0 : fail("cannot allocate the model's buffers");
+}
+
+extern "C" int pz_ai_sam_encode(pz_ai* h, const pz_image* img, float* emb) {
+    g_err.clear();
+
+    if (!h || !img || !img->px) {
+        return fail("no image");
+    }
+
+    double f = 1024.0 / std::max(img->w, img->h);
+    int w = std::max(1, (int)lrint(img->w * f)), hh = std::max(1, (int)lrint(img->h * f));
+    pz_image r = {0, 0, NULL};
+
+    if (pz_resize(img, w, hh, &r) != 0) {
+        return fail("out of memory");
+    }
+
+    /* always 1024 x 1024: the model normalises, then pads with zeros, so
+       padding here with SAM's mean colour is the same -- and keeps MNN's
+       shape-dependent padding out of it */
+    const int S = 1024;
+    std::vector<int> shp = {S, S, 3};
+
+    if (h->in_shape != shp) {
+        set_input(h, nullptr, shp, nullptr, true);
+
+        if (run_resized(h) != 0) {
+            pz_free(&r);
+            return -1;
+        }
+
+        h->in_shape = shp;
+    }
+
+    std::vector<float> buf((size_t)S * S * 3);
+
+    for (size_t i = 0; i < (size_t)S * S; i++) {
+        buf[i * 3] = 123.675f;
+        buf[i * 3 + 1] = 116.28f;
+        buf[i * 3 + 2] = 103.53f;
+    }
+
+    for (int y = 0; y < hh; y++) {
+        for (int x = 0; x < w; x++) { /* HWC RGB 0..255 */
+            uint32_t p = r.px[(size_t)y * w + x];
+            float* q = &buf[((size_t)y * S + x) * 3];
+            q[0] = (float)((p >> 16) & 255);
+            q[1] = (float)((p >> 8) & 255);
+            q[2] = (float)(p & 255);
+        }
+    }
+
+    pz_free(&r);
+    MNN::Tensor* in = h->net->getSessionInput(h->sess, nullptr);
+    /* a plain H x W x 3 buffer: the host tensor takes the input's own
+       layout, so nothing gets reordered on the way in */
+    std::unique_ptr<MNN::Tensor> host(new MNN::Tensor(in, in->getDimensionType()));
+    memcpy(host->host<float>(), buf.data(), buf.size() * sizeof(float));
+
+    if (!in->copyFromHostTensor(host.get()) || h->net->runSession(h->sess) != MNN::NO_ERROR) {
+        return fail("MNN runSession failed");
+    }
+
+    MNN::Tensor* out = h->net->getSessionOutput(h->sess, nullptr);
+    std::unique_ptr<MNN::Tensor> ho(new MNN::Tensor(out, MNN::Tensor::CAFFE));
+    out->copyToHostTensor(ho.get());
+
+    if (ho->elementSize() != PZ_SAM_EMB) {
+        return fail("unexpected SAM embedding size");
+    }
+
+    memcpy(emb, ho->host<float>(), PZ_SAM_EMB * sizeof(float));
+
+    if (getenv("PZ_AI_DEBUG")) {
+        double m = 0, q = 0;
+
+        for (int i = 0; i < PZ_SAM_EMB; i++) {
+            m += emb[i];
+            q += (double)emb[i] * emb[i];
+        }
+
+        m /= PZ_SAM_EMB;
+        fprintf(stderr, "[sam] input %dx%d, emb mean %g std %g\n", w, hh, m, std::sqrt(q / PZ_SAM_EMB - m * m));
+    }
+
+    if (h->cache_dirty) {
+        h->net->updateCacheFile(h->sess);
+        h->cache_dirty = false;
+    }
+
+    return 0;
+}
+
+extern "C" int pz_ai_sam_mask(pz_ai* h, const float* emb, int w, int hgt, const float* pts,
+                              const int* labels, int n, unsigned char* mask) {
+    using namespace MNN::Express;
+    g_err.clear();
+
+    if (!h || h->dec_base.empty() || !emb || n <= 0 || w <= 0 || hgt <= 0) {
+        return fail("nothing to select");
+    }
+
+    /* SAM's points live in the 1024 px frame; a padding point (-1) goes
+     * last when there is no box */
+    const double f = 1024.0 / std::max(w, hgt);
+    /* the clicks (up to 5), then SAM's one padding point (label -1) */
+    n = std::min(n, 5);
+    const int NP = n + 1;
+
+    if (!h->mod[NP]) {
+        h->mod[NP].reset(MNN::Express::Module::load({"image_embeddings", "point_coords", "point_labels",
+                         "mask_input", "has_mask_input", "orig_im_size"}, {"low_res_masks"},
+                         (h->dec_base + std::to_string(NP) + ".mnn").c_str()));
+
+        if (!h->mod[NP]) {
+            return fail("cannot load the SAM decoder for " + std::to_string(n) + " points");
+        }
+    }
+
+    VARP E = _Input({1, 256, 64, 64}, NCHW), P = _Input({1, NP, 2}, NCHW), L = _Input({1, NP}, NCHW);
+    VARP MI = _Input({1, 1, 256, 256}, NCHW), HM = _Input({1}, NCHW), OS = _Input({2}, NCHW);
+    memcpy(E->writeMap<float>(), emb, PZ_SAM_EMB * sizeof(float));
+    float* pc = P->writeMap<float>(), *pl = L->writeMap<float>();
+
+    for (int i = 0; i < n; i++) {
+        pc[i * 2] = (float)((pts[i * 2] + 0.5) * f);
+        pc[i * 2 + 1] = (float)((pts[i * 2 + 1] + 0.5) * f);
+        pl[i] = (float)labels[i];
+    }
+
+    for (int i = n; i < NP; i++) {
+        pc[i * 2] = 0;
+        pc[i * 2 + 1] = 0;
+        pl[i] = -1;
+    }
+
+    memset(MI->writeMap<float>(), 0, 256 * 256 * sizeof(float));
+    HM->writeMap<float>()[0] = 0;
+    OS->writeMap<float>()[0] = (float)hgt;
+    OS->writeMap<float>()[1] = (float)w;
+    std::vector<VARP> outs = h->mod[NP]->onForward({E, P, L, MI, HM, OS});
+
+    if (outs.empty()) {
+        return fail("the SAM decoder failed");
+    }
+
+    /* the low-res logits (256 px over the padded 1024 frame), upsampled
+     * here to w x hgt */
+    VARP lo = _Convert(outs[0], NCHW);
+    const float* Lg = lo->readMap<float>();
+
+    if (!Lg || lo->getInfo()->size < 256 * 256) {
+        return fail("unexpected SAM decoder output");
+    }
+
+    if (getenv("PZ_AI_DEBUG")) {
+        auto info = lo->getInfo();
+        float mn = 1e9f, mx = -1e9f;
+        int pos = 0;
+
+        for (int i = 0; i < 256 * 256; i++) {
+            mn = std::min(mn, Lg[i]);
+            mx = std::max(mx, Lg[i]);
+            pos += Lg[i] > 0;
+        }
+
+        fprintf(stderr, "[sam] low-res dims %d x %d x %d x %d, range %g..%g, %.1f%% > 0\n",
+                info->dim.size() > 0 ? info->dim[0] : -1, info->dim.size() > 1 ? info->dim[1] : -1,
+                info->dim.size() > 2 ? info->dim[2] : -1, info->dim.size() > 3 ? info->dim[3] : -1, mn, mx,
+                pos * 100.0 / 65536);
+    }
+
+    for (int y = 0; y < hgt; y++) {
+        for (int x = 0; x < w; x++) {
+            double sx = (x + 0.5) * f / 4.0 - 0.5, sy = (y + 0.5) * f / 4.0 - 0.5;
+            int x0 = std::max(0, std::min(255, (int)std::floor(sx))), y0 = std::max(0, std::min(255, (int)std::floor(sy)));
+            int x1 = std::min(255, x0 + 1), y1 = std::min(255, y0 + 1);
+            double fx = std::max(0.0, std::min(1.0, sx - x0)), fy = std::max(0.0, std::min(1.0, sy - y0));
+            double v = (Lg[y0 * 256 + x0] * (1 - fx) + Lg[y0 * 256 + x1] * fx) * (1 - fy) +
+                       (Lg[y1 * 256 + x0] * (1 - fx) + Lg[y1 * 256 + x1] * fx) * fy;
+            mask[(size_t)y * w + x] = v > 0 ? 255 : 0;
+        }
+    }
+
+    return 0;
+}
+
+extern "C" int pz_ai_inpaint(pz_ai* h, pz_image* img, const unsigned char* mask) {
+    g_err.clear();
+
+    if (!h || !img || !img->px || !mask) {
+        return fail("nothing to remove");
+    }
+
+    const int W = img->w, H = img->h;
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            if (mask[(size_t)y * W + x]) {
+                x0 = std::min(x0, x);
+                x1 = std::max(x1, x);
+                y0 = std::min(y0, y);
+                y1 = std::max(y1, y);
+            }
+        }
+    }
+
+    if (x1 < 0) {
+        return 0; /* empty mask */
+    }
+
+    /* a square of context around the mask, about twice its size */
+    int side = std::max(x1 - x0 + 1, y1 - y0 + 1);
+    side = std::min(std::max(W, H), std::max(64, side * 2));
+    int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    int bx = std::max(0, std::min(W - std::min(side, W), cx - side / 2));
+    int by = std::max(0, std::min(H - std::min(side, H), cy - side / 2));
+    int bw = std::min(side, W), bh = std::min(side, H);
+    const int S = 512;
+    /* the crop and its mask (grown a little: SAM's edges are tight) */
+    pz_image crop = {0, 0, NULL}, cs = {0, 0, NULL};
+
+    if (pz_alloc(&crop, bw, bh) != 0) {
+        return fail("out of memory");
+    }
+
+    for (int y = 0; y < bh; y++) {
+        memcpy(crop.px + (size_t)y * bw, img->px + (size_t)(by + y) * W + bx, (size_t)bw * 4);
+    }
+
+    if (pz_resize(&crop, S, S, &cs) != 0) {
+        pz_free(&crop);
+        return fail("out of memory");
+    }
+
+    pz_free(&crop);
+    std::vector<float> im(3 * S * S), mk(S * S);
+    const int grow = std::max(2, S / 64);
+    std::vector<unsigned char> m512(S * S, 0);
+
+    for (int y = 0; y < S; y++) {
+        for (int x = 0; x < S; x++) {
+            int sx = bx + (int)((x + 0.5) * bw / S), sy = by + (int)((y + 0.5) * bh / S);
+            m512[y * S + x] = mask[(size_t)std::min(H - 1, sy) * W + std::min(W - 1, sx)] ? 1 : 0;
+        }
+    }
+
+    for (int y = 0; y < S; y++) {
+        for (int x = 0; x < S; x++) {
+            bool on = false;
+
+            for (int dy = -grow; dy <= grow && !on; dy++) {
+                for (int dx = -grow; dx <= grow && !on; dx++) {
+                    int yy = y + dy, xx = x + dx;
+                    on = yy >= 0 && xx >= 0 && yy < S && xx < S && m512[yy * S + xx];
+                }
+            }
+
+            mk[y * S + x] = on ? 1.f : 0.f;
+            uint32_t p = cs.px[y * S + x];
+            im[y * S + x] = ((p >> 16) & 255) / 255.f;
+            im[S * S + y * S + x] = ((p >> 8) & 255) / 255.f;
+            im[2 * S * S + y * S + x] = (p & 255) / 255.f;
+        }
+    }
+
+    pz_free(&cs);
+
+    if (h->in_shape.empty()) {
+        set_input(h, "image", {1, 3, S, S}, nullptr, true);
+        set_input(h, "mask", {1, 1, S, S}, nullptr, true);
+
+        if (run_resized(h) != 0) {
+            return -1;
+        }
+
+        h->in_shape = {1, 3, S, S};
+    }
+
+    if (copy_input(h, "image", {1, 3, S, S}, im.data()) || copy_input(h, "mask", {1, 1, S, S}, mk.data())) {
+        return -1;
+    }
+
+    if (h->net->runSession(h->sess) != MNN::NO_ERROR) {
+        return fail("MNN runSession failed");
+    }
+
+    MNN::Tensor* out = h->net->getSessionOutput(h->sess, nullptr);
+    std::unique_ptr<MNN::Tensor> ho(new MNN::Tensor(out, MNN::Tensor::CAFFE));
+    out->copyToHostTensor(ho.get());
+
+    if (h->cache_dirty) {
+        h->net->updateCacheFile(h->sess);
+        h->cache_dirty = false;
+    }
+
+    const float* o = ho->host<float>();
+    /* LaMa's 512 px result back at the crop's size, then blended in where
+     * the (grown) mask is, with a soft edge */
+    pz_image res = {0, 0, NULL}, rb = {0, 0, NULL};
+    pz_alloc(&res, S, S);
+
+    for (int i = 0; i < S * S; i++) {
+        int r = (int)std::min(255.f, std::max(0.f, o[i])), g = (int)std::min(255.f, std::max(0.f, o[S * S + i])),
+            b = (int)std::min(255.f, std::max(0.f, o[2 * S * S + i]));
+        res.px[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+
+    if (pz_resize(&res, bw, bh, &rb) != 0) {
+        pz_free(&res);
+        return fail("out of memory");
+    }
+
+    pz_free(&res);
+    const int feather = std::max(2, grow * bw / S);
+
+    for (int y = 0; y < bh; y++) {
+        for (int x = 0; x < bw; x++) {
+            /* the grown 512 px mask, sampled at this pixel, softened */
+            double a = 0;
+            int nn = 0;
+
+            for (int dy = -feather; dy <= feather; dy += std::max(1, feather / 2)) {
+                for (int dx = -feather; dx <= feather; dx += std::max(1, feather / 2)) {
+                    int mx = (int)((x + dx + 0.5) * S / bw), my = (int)((y + dy + 0.5) * S / bh);
+
+                    if (mx >= 0 && my >= 0 && mx < S && my < S) {
+                        a += mk[my * S + mx];
+                    }
+
+                    nn++;
+                }
+            }
+
+            a /= std::max(1, nn);
+
+            if (a <= 0) {
+                continue;
+            }
+
+            uint32_t& d = img->px[(size_t)(by + y) * W + bx + x];
+            uint32_t s2 = rb.px[(size_t)y * bw + x];
+            uint32_t v = d & 0xFF000000u;
+
+            for (int c = 0; c < 24; c += 8) {
+                double q = ((d >> c) & 255) * (1 - a) + ((s2 >> c) & 255) * a;
+                v |= (uint32_t)lrint(q) << c;
+            }
+
+            d = v;
+        }
+    }
+
+    pz_free(&rb);
+    return 0;
 }

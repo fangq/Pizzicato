@@ -8,6 +8,9 @@
  *   pzai_cli [-d ...] --clip-image vision.mnn photo.jpg out.f32
  *   pzai_cli [-d ...] --clip-text text.mnn vocab.json merges.txt "words" out.f32
  *   pzai_cli [-d ...] --faces yunet.mnn sface.mnn photo out.txt   (boxes + embeddings)
+ *   pzai_cli [-d ...] --remove sam_enc.mnn sam_dec.mnn lama.mnn photo "x,y" out.jpg
+ *       (select the subject at x,y -- 0..1 of the photo -- and remove it;
+ *        also writes out.jpg.mask.png-like out.mask.pgm)
  *
  * --raw runs one forward pass on a float NCHW RGB tile, for parity tests
  * against onnxruntime (tests/ai_parity.py).
@@ -38,7 +41,7 @@ static int progress(void* user, int done, int total) {
 
 int main(int argc, char** argv) {
     int device = PZ_AI_OPENCL, tile = 0, overlap = 32, quality = 95, raw = 0, clip = 0, i;
-    const char* a[5];
+    const char* a[7];
     int na = 0;
 
     for (i = 1; i < argc; i++) {
@@ -59,7 +62,9 @@ int main(int argc, char** argv) {
             clip = 2;
         } else if (!strcmp(argv[i], "--faces")) {
             clip = 3;
-        } else if (na < 5) {
+        } else if (!strcmp(argv[i], "--remove")) {
+            clip = 4;
+        } else if (na < 7) {
             a[na++] = argv[i];
         }
     }
@@ -76,6 +81,89 @@ int main(int argc, char** argv) {
 
     double t0 = now();
     pz_ai* h;
+
+    if (clip == 4) {
+        pz_ai* enc, *dec, *lama;
+        pz_image img = {0, 0, NULL};
+        pz_meta meta;
+        float px, py, pt[2];
+        int lab = 1;
+
+        if (na < 6 || pz_ai_open(a[0], device, -1, 0, &enc) || pz_ai_open(a[1], PZ_AI_CPU, -1, 0, &dec) ||
+                pz_ai_open(a[2], device, -1, 0, &lama)) {
+            fprintf(stderr, "open: %s\n", pz_ai_error());
+            return 1;
+        }
+
+        if (pz_load(a[3], 1600, 1600, 0, &img, &meta) != 0 || sscanf(a[4], "%f,%f", &px, &py) != 2) {
+            fprintf(stderr, "cannot load %s or parse %s\n", a[3], a[4]);
+            return 1;
+        }
+
+        float* emb = malloc(PZ_SAM_EMB * sizeof(float));
+        unsigned char* m = malloc((size_t)img.w * img.h);
+        int k;
+
+        for (k = 0; k < 2; k++) {
+            t0 = now();
+
+            if (pz_ai_sam_encode(enc, &img, emb) != 0) {
+                fprintf(stderr, "encode: %s\n", pz_ai_error());
+                return 1;
+            }
+
+            fprintf(stderr, "  SAM encode %d: %.1f ms (%s)\n", k, (now() - t0) * 1e3, pz_ai_backend(enc));
+        }
+
+        pt[0] = px * img.w;
+        pt[1] = py * img.h;
+
+        for (k = 0; k < 2; k++) {
+            t0 = now();
+
+            if (pz_ai_sam_mask(dec, emb, img.w, img.h, pt, &lab, 1, m) != 0) {
+                fprintf(stderr, "mask: %s\n", pz_ai_error());
+                return 1;
+            }
+
+            fprintf(stderr, "  SAM mask %d: %.1f ms\n", k, (now() - t0) * 1e3);
+        }
+
+        size_t on = 0, q;
+
+        for (q = 0; q < (size_t)img.w * img.h; q++) {
+            on += m[q] != 0;
+        }
+
+        fprintf(stderr, "  mask covers %.1f%%\n", 100.0 * on / ((double)img.w * img.h));
+        char mp[1024];
+        snprintf(mp, sizeof(mp), "%s.mask.pgm", a[5]);
+        FILE* f = fopen(mp, "wb");
+        fprintf(f, "P5 %d %d 255\n", img.w, img.h);
+        fwrite(m, 1, (size_t)img.w * img.h, f);
+        fclose(f);
+
+        for (k = 0; k < 2; k++) {
+            pz_image c = {0, 0, NULL};
+            pz_copy(&img, &c);
+            t0 = now();
+
+            if (pz_ai_inpaint(lama, &c, m) != 0) {
+                fprintf(stderr, "inpaint: %s\n", pz_ai_error());
+                return 1;
+            }
+
+            fprintf(stderr, "  LaMa %d: %.1f ms (%s)\n", k, (now() - t0) * 1e3, pz_ai_backend(lama));
+
+            if (k == 1) {
+                pz_save_jpeg(a[5], &c, 92);
+            }
+
+            pz_free(&c);
+        }
+
+        return 0;
+    }
 
     if (clip == 3) {
         pz_ai* rec;

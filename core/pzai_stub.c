@@ -121,3 +121,30 @@ int pz_ai_face_embed(pz_ai* rec, const pz_image* img, const pz_face* f, float* e
     (void)emb;
     return -1;
 }
+
+int pz_ai_sam_encode(pz_ai* enc, const pz_image* img, float* emb) {
+    (void)enc;
+    (void)img;
+    (void)emb;
+    return -1;
+}
+
+int pz_ai_sam_mask(pz_ai* dec, const float* emb, int w, int h, const float* pts,
+                   const int* labels, int n, unsigned char* mask) {
+    (void)dec;
+    (void)emb;
+    (void)w;
+    (void)h;
+    (void)pts;
+    (void)labels;
+    (void)n;
+    (void)mask;
+    return -1;
+}
+
+int pz_ai_inpaint(pz_ai* lama, pz_image* img, const unsigned char* mask) {
+    (void)lama;
+    (void)img;
+    (void)mask;
+    return -1;
+}

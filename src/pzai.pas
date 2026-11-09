@@ -34,13 +34,14 @@ function pz_ai_run_tiled(h: Ppz_ai; img, out_: Ppz_image;
   cdecl; external;
 
 type
-  TPzAIKind = (akDenoise, akDenoiseHQ, akUpscale);
+  TPzAIKind = (akDenoise, akDenoiseHQ, akUpscale, akRemove);
 
   TPzAIProgressEvent = procedure(Done, Total: Integer) of object;
 
 const
   PZ_AI_NAMES: array[TPzAIKind] of string =
-    ('AI denoise', 'AI denoise (HQ)', 'AI upscale');
+    ('AI denoise', 'AI denoise (HQ)', 'AI upscale',
+    'AI remove');
 
 { built with MNN }
 function PzAIAvailable: Boolean;
@@ -65,8 +66,38 @@ function DenoiseOf(const Filters: string; out Amount: Double; out K: TPzAIKind):
   scaled down first. Returns 0, 1 cancelled, <0 error. }
 function PzUpscale(var Img: Tpz_image; Scale: Integer; Cancel: PInteger = nil;
   MaxMP: Double = 250): Integer;
-{ apply a chain's AI steps to a full image in this thread (export) }
-procedure PzAIApplyChain(var Img: Tpz_image; const Filters: string; Cancel: PInteger);
+{ apply a chain's AI steps to a full image in this thread (export);
+  PhotoPath finds the removal masks }
+procedure PzAIApplyChain(var Img: Tpz_image; const Filters, PhotoPath: string;
+  Cancel: PInteger);
+{ removal masks: <album>/.pizzicato/<photo>.<k>.png, in the upright
+  camera image's frame, any size }
+function PzMaskPath(const PhotoPath: string; K: Integer): string;
+{ the chain's pzremove steps' mask numbers, in order }
+function RemoveSteps(const Filters: string): TStringArray;
+{ remove the masked area of Img in this thread (LaMa) }
+function PzAIInpaint(var Img: Tpz_image; const MaskFile: string): Integer;
+
+type
+  { MobileSAM in the main thread: one image's embedding, then masks }
+  TPzSam = class
+  private
+    FEnc, FDec: Ppz_ai;
+    FEmb: array of Single;
+    FW, FH: Integer;
+    FKey: string;
+    FError: string;
+  public
+    destructor Destroy; override;
+    { compute the embedding of Img unless Key is the one already there }
+    function Embed(const Key: string; const Img: Tpz_image): Boolean;
+    { points: x, y pairs in Img pixels; labels 1 = subject, 0 = keep }
+    function Mask(const Pts: array of Single; const Labels: array of Integer;
+      out M: TBytes): Boolean;
+    property W: Integer read FW;
+    property H: Integer read FH;
+    property Error: string read FError;
+  end;
 
 type
   TPzAIJob = class
@@ -76,6 +107,7 @@ type
     CachePath: string;  // on-disk copy of the result ('' = none)
     Tag: Pointer;       // the photo
     Img: Tpz_image;     // input; the result when OK
+    MaskFile: string;   // akRemove: the mask
     OK: Boolean;
     Cancel: Integer;    // set to 1 to stop it between tiles
     Error: string;
@@ -126,10 +158,10 @@ uses
 
 const
   MODEL_FILES: array[TPzAIKind] of string = ('nafnet_sidd.mnn', 'scunet_real.mnn',
-    'esrgan_x4v3.mnn');
+    'esrgan_x4v3.mnn', 'lama.mnn');
   { overlap between tiles, in input pixels }
-  MODEL_OVERLAP: array[TPzAIKind] of Integer = (32, 32, 8);
-  MODEL_TILE: array[TPzAIKind] of Integer = (0, 256, 0);
+  MODEL_OVERLAP: array[TPzAIKind] of Integer = (32, 32, 8, 0);
+  MODEL_TILE: array[TPzAIKind] of Integer = (0, 256, 0, -1);
 
 threadvar
   THandles: array[TPzAIKind] of Ppz_ai;
@@ -337,20 +369,184 @@ begin
   end;
 end;
 
-procedure PzAIApplyChain(var Img: Tpz_image; const Filters: string; Cancel: PInteger);
+procedure PzAIApplyChain(var Img: Tpz_image; const Filters, PhotoPath: string;
+  Cancel: PInteger);
 var
   A: Double;
   K: TPzAIKind;
   D: Tpz_image;
+  R: TStringArray;
+  i: Integer;
 begin
-  if not DenoiseOf(Filters, A, K) then
+  if DenoiseOf(Filters, A, K) then
+  begin
+    PzInit(D);
+    if pz_copy(@Img, @D) = 0 then
+    begin
+      if PzAIRun(K, D, Cancel) = 0 then
+        PzMix(Img, D, A);
+      pz_free(@D);
+    end;
+  end;
+  R := RemoveSteps(Filters);
+  for i := 0 to High(R) do
+    PzAIInpaint(Img, PzMaskPath(PhotoPath, StrToIntDef(R[i], 0)));
+end;
+
+function PzMaskPath(const PhotoPath: string; K: Integer): string;
+begin
+  Result := ExtractFilePath(PhotoPath) + '.pizzicato/' +
+    ExtractFileName(PhotoPath) + '.' + IntToStr(K) + '.png';
+end;
+
+function RemoveSteps(const Filters: string): TStringArray;
+var
+  C: TPzChain;
+  i: Integer;
+begin
+  Result := nil;
+  if Pos('pzremove', Filters) = 0 then
     Exit;
-  PzInit(D);
-  if pz_copy(@Img, @D) <> 0 then
+  C := ParseChain(Filters);
+  for i := 0 to High(C) do
+    if (C[i].Name = 'pzremove') and (Length(C[i].Args) > 0) then
+    begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := C[i].Args[0];
+    end;
+end;
+
+function pz_ai_sam_encode(enc: Ppz_ai; img: Ppz_image; emb: PSingle): cint;
+  cdecl; external;
+function pz_ai_sam_mask(dec: Ppz_ai; emb: PSingle; w, h: cint;
+  pts: PSingle; labels: PInteger; n: cint; mask: PByte): cint; cdecl; external;
+function pz_ai_inpaint(lama: Ppz_ai; img: Ppz_image; mask: PByte): cint; cdecl; external;
+
+const
+  SAM_EMB = 256 * 64 * 64;
+
+{ a mask file sampled to W x H bytes (nonzero = remove) }
+function LoadMask(const F: string; W, H: Integer; out M: TBytes): Boolean;
+var
+  Img: Tpz_image;
+  Meta: Tpz_meta;
+  x, y: Integer;
+begin
+  Result := False;
+  M := nil;
+  PzInit(Img);
+  if pz_load(PAnsiChar(F), 0, 0, 0, @Img, @Meta) < 0 then
     Exit;
-  if PzAIRun(K, D, Cancel) = 0 then
-    PzMix(Img, D, A);
-  pz_free(@D);
+  SetLength(M, W * H);
+  for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+      if (Img.px[(y * Img.h div H) * Img.w + (x * Img.w div W)] and $FF) > 127 then
+        M[y * W + x] := 255
+      else
+        M[y * W + x] := 0;
+  pz_free(@Img);
+  Result := True;
+end;
+
+function PzAIInpaint(var Img: Tpz_image; const MaskFile: string): Integer;
+var
+  H: Ppz_ai;
+  Why: string;
+  M: TBytes;
+begin
+  TLastError := '';
+  if not PzAIReady(akRemove, Why) then
+  begin
+    TLastError := Why;
+    Exit(-1);
+  end;
+  if not LoadMask(MaskFile, Img.w, Img.h, M) then
+  begin
+    TLastError := 'cannot read the mask ' + MaskFile;
+    Exit(-1);
+  end;
+  H := THandles[akRemove];
+  if H = nil then
+  begin
+    if pz_ai_open(PAnsiChar(PzAIModelFile(akRemove)), PZ_AI_OPENCL, -1, 0, @H) <> 0 then
+    begin
+      TLastError := StrPas(pz_ai_error);
+      Exit(-1);
+    end;
+    THandles[akRemove] := H;
+  end;
+  Result := pz_ai_inpaint(H, @Img, @M[0]);
+  if Result <> 0 then
+    TLastError := StrPas(pz_ai_error);
+end;
+
+{ TPzSam }
+
+destructor TPzSam.Destroy;
+begin
+  if FEnc <> nil then
+    pz_ai_close(FEnc);
+  if FDec <> nil then
+    pz_ai_close(FDec);
+  inherited Destroy;
+end;
+
+function TPzSam.Embed(const Key: string; const Img: Tpz_image): Boolean;
+var
+  Dir: string;
+begin
+  Result := (Key = FKey) and (FEmb <> nil);
+  if Result then
+    Exit;
+  FError := '';
+  Dir := PzAIModelDir + '/';
+  if not PzAIAvailable or not FileExists(Dir + 'mobilesam_enc.mnn') or
+    not FileExists(Dir + 'mobilesam_dec2.mnn') then
+  begin
+    FError := 'The subject-selection model (MobileSAM) is not installed in ' +
+      PzAIModelDir + '. Run tools/fetch_models.sh mobilesam.';
+    Exit;
+  end;
+  if (FEnc = nil) and (pz_ai_open(PAnsiChar(Dir + 'mobilesam_enc.mnn'),
+    PZ_AI_OPENCL, -1, 0, @FEnc) <> 0) then
+  begin
+    FError := StrPas(pz_ai_error);
+    Exit;
+  end;
+  if (FDec = nil) and (pz_ai_open(PAnsiChar(Dir + 'mobilesam_dec.mnn'),
+    PZ_AI_CPU, -1, 0, @FDec) <> 0) then
+  begin
+    FError := StrPas(pz_ai_error);
+    Exit;
+  end;
+  SetLength(FEmb, SAM_EMB);
+  Result := pz_ai_sam_encode(FEnc, @Img, @FEmb[0]) = 0;
+  if Result then
+  begin
+    FKey := Key;
+    FW := Img.w;
+    FH := Img.h;
+  end
+  else
+  begin
+    FError := StrPas(pz_ai_error);
+    FEmb := nil;
+    FKey := '';
+  end;
+end;
+
+function TPzSam.Mask(const Pts: array of Single; const Labels: array of Integer;
+  out M: TBytes): Boolean;
+begin
+  M := nil;
+  Result := False;
+  if (FEmb = nil) or (Length(Labels) = 0) then
+    Exit;
+  SetLength(M, FW * FH);
+  Result := pz_ai_sam_mask(FDec, @FEmb[0], FW, FH, @Pts[0], @Labels[0],
+    Length(Labels), @M[0]) = 0;
+  if not Result then
+    FError := StrPas(pz_ai_error);
 end;
 
 { TPzAIJob }
@@ -530,7 +726,10 @@ begin
     if not J.OK then
     begin
       FProgTag := J.Tag;
-      rc := PzAIRun(J.Kind, J.Img, @J.Cancel, @JobProgress);
+      if J.Kind = akRemove then
+        rc := PzAIInpaint(J.Img, J.MaskFile)
+      else
+        rc := PzAIRun(J.Kind, J.Img, @J.Cancel, @JobProgress);
       J.OK := rc = 0;
       if rc < 0 then
         J.Error := PzAILastError;
