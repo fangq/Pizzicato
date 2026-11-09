@@ -60,6 +60,11 @@ function PzAILastError: string;
 procedure PzMix(var Img: Tpz_image; const Other: Tpz_image; Amount: Double);
 { the chain's AI denoise step (pzdenoise=1,<amount>,<hq>;, always first) }
 function DenoiseOf(const Filters: string; out Amount: Double; out K: TPzAIKind): Boolean;
+{ AI upscale by 2 or 4 in this thread (Real-ESRGAN is x4; x2 resamples its
+  result down). Outputs are capped at MaxMP megapixels: a larger request is
+  scaled down first. Returns 0, 1 cancelled, <0 error. }
+function PzUpscale(var Img: Tpz_image; Scale: Integer; Cancel: PInteger = nil;
+  MaxMP: Double = 250): Integer;
 { apply a chain's AI steps to a full image in this thread (export) }
 procedure PzAIApplyChain(var Img: Tpz_image; const Filters: string; Cancel: PInteger);
 
@@ -289,6 +294,46 @@ begin
     Amount := FArg(C[0], 0, 0.8);
     if FArg(C[0], 1, 0) >= 0.5 then
       K := akDenoiseHQ;
+  end;
+end;
+
+function PzUpscale(var Img: Tpz_image; Scale: Integer; Cancel: PInteger;
+  MaxMP: Double): Integer;
+var
+  TW, TH: Integer;
+  f: Double;
+  T: Tpz_image;
+begin
+  Result := 0;
+  if (Scale <= 1) or (Img.px = nil) then
+    Exit;
+  TW := Img.w * Scale;
+  TH := Img.h * Scale;
+  { the x4 model's output must fit too: shrink the input when needed }
+  f := Sqrt(MaxMP * 1e6 / (Img.w * 4.0 * Img.h * 4.0));
+  if f < 1 then
+  begin
+    PzInit(T);
+    if pz_resize(@Img, Max(1, Round(Img.w * f)), Max(1, Round(Img.h * f)), @T) <> 0 then
+      Exit(-1);
+    pz_free(@Img);
+    Img := T;
+    if TW * Double(TH) > MaxMP * 1e6 then
+    begin
+      f := Sqrt(MaxMP * 1e6 / (TW * Double(TH)));
+      TW := Round(TW * f);
+      TH := Round(TH * f);
+    end;
+  end;
+  Result := PzAIRun(akUpscale, Img, Cancel);
+  if (Result = 0) and ((Img.w <> TW) or (Img.h <> TH)) then
+  begin
+    PzInit(T);
+    if pz_resize(@Img, TW, TH, @T) = 0 then
+    begin
+      pz_free(@Img);
+      Img := T;
+    end;
   end;
 end;
 

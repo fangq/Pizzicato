@@ -2109,11 +2109,38 @@ begin
   RenderCurrent;
 end;
 
+{ one photo of an export: decode at full resolution, the AI steps, the
+  chain, an optional AI upscale, then a JPEG. Any thread. }
+function ExportImage(const Path, Edits: string; Rot, Flags, Scale: Integer;
+  const Dest: string; out W, H: Integer): Boolean;
+var
+  Img: Tpz_image;
+  M: Tpz_meta;
+begin
+  Result := False;
+  W := 0;
+  H := 0;
+  PzInit(Img);
+  if pz_load(PAnsiChar(Path), 0, 0, Flags, @Img, @M) < 0 then
+    Exit;
+  try
+    PzAIApplyChain(Img, Edits, nil);
+    RenderChain(Img, ParseChain(Edits), Rot);
+    if Scale > 1 then
+      PzUpscale(Img, Scale);
+    W := Img.w;
+    H := Img.h;
+    Result := pz_save_jpeg(PAnsiChar(Dest), @Img, 92) = 0;
+  finally
+    pz_free(@Img);
+  end;
+end;
+
 type
   TExportThread = class(TThread)
     Paths, Edits, Dests: TStringList;
     Rots: array of Integer;
-    Flags: Integer;
+    Flags, Scale: Integer;
     Done: Integer;
     procedure Execute; override;
     destructor Destroy; override;
@@ -2121,21 +2148,13 @@ type
 
 procedure TExportThread.Execute;
 var
-  i: Integer;
-  Img: Tpz_image;
-  M: Tpz_meta;
+  i, W, H: Integer;
 begin
   for i := 0 to Paths.Count - 1 do
   begin
     if Terminated then
       Break;
-    if pz_load(PAnsiChar(Paths[i]), 0, 0, Flags, @Img, @M) >= 0 then
-    begin
-      PzAIApplyChain(Img, Edits[i], nil);
-      RenderChain(Img, ParseChain(Edits[i]), Rots[i]);
-      pz_save_jpeg(PAnsiChar(Dests[i]), @Img, 92);
-      pz_free(@Img);
-    end;
+    ExportImage(Paths[i], Edits[i], Rots[i], Flags, Scale, Dests[i], W, H);
     Done := i + 1;
   end;
   PzAICloseThread;
@@ -2149,13 +2168,65 @@ begin
   inherited Destroy;
 end;
 
+{ export size: the photo's own, or an AI upscale (when the model is there) }
+function AskExportScale(out Scale: Integer): Boolean;
+var
+  F: TForm;
+  R: TRadioGroup;
+  B1, B2: TButton;
+  Why: string;
+begin
+  Scale := 1;
+  if not PzAIReady(akUpscale, Why) then
+    Exit(True);
+  F := TForm.CreateNew(nil);
+  try
+    F.Caption := 'Export';
+    F.Width := 340;
+    F.Height := 190;
+    F.Position := poOwnerFormCenter;
+    R := TRadioGroup.Create(F);
+    R.Parent := F;
+    R.SetBounds(10, 8, 320, 120);
+    R.Caption := 'Size';
+    R.Items.Add('Original size (after crop)');
+    R.Items.Add('2x larger (AI upscale)');
+    R.Items.Add('4x larger (AI upscale)');
+    R.ItemIndex := 0;
+    B1 := TButton.Create(F);
+    B1.Parent := F;
+    B1.SetBounds(150, 140, 84, 30);
+    B1.Caption := 'Export';
+    B1.ModalResult := mrOk;
+    B1.Default := True;
+    B2 := TButton.Create(F);
+    B2.Parent := F;
+    B2.SetBounds(244, 140, 84, 30);
+    B2.Caption := 'Cancel';
+    B2.ModalResult := mrCancel;
+    B2.Cancel := True;
+    Result := F.ShowModal = mrOk;
+    if Result then
+      Scale := 1 shl R.ItemIndex;
+  finally
+    F.Free;
+  end;
+end;
+
 procedure TMainForm.ExportPhotos(L: TList; const Dir: string);
 var
   T: TExportThread;
-  i: Integer;
+  i, Scale: Integer;
   P: TPzPhoto;
+  Suffix: string;
 begin
+  if not AskExportScale(Scale) then
+    Exit;
+  Suffix := '';
+  if Scale > 1 then
+    Suffix := Format('_%dx', [Scale]);
   T := TExportThread.Create(True);
+  T.Scale := Scale;
   T.FreeOnTerminate := True;
   T.Paths := TStringList.Create;
   T.Edits := TStringList.Create;
@@ -2169,7 +2240,8 @@ begin
     T.Paths.Add(P.Path);
     T.Edits.Add(P.Filters);
     T.Rots[i] := P.Rotate;
-    T.Dests.Add(IncludeTrailingPathDelimiter(Dir) + ChangeFileExt(P.Name, '.jpg'));
+    T.Dests.Add(IncludeTrailingPathDelimiter(Dir) + ChangeFileExt(P.Name, '') +
+      Suffix + '.jpg');
   end;
   T.Start;
   Status.SimpleText := Format('Exporting %d photo(s) to %s …', [L.Count, Dir]);

@@ -284,6 +284,7 @@ var
   Why: string;
   Img: Tpz_image;
   M: Tpz_meta;
+  W, H: Integer;
 
   function WaitAI(Lvl: Integer; TimeoutSec: Double): Double;
   var
@@ -336,6 +337,19 @@ begin
     BLog(Format('    export path (PzAIApplyChain)   %8.0f ms  %s', [(NowSeconds - T0) * 1000,
       IfThen(PzAILastError = '', 'ok', PzAILastError)]));
     pz_free(@Img);
+  end;
+  { export of a 25% crop at 4x, through the export code itself }
+  if PzAIReady(akUpscale, Why) then
+  begin
+    T0 := NowSeconds;
+    ExportImage(P.Path, 'crop64=1,' + Crop64Encode(0.375, 0.375, 0.625, 0.625) + ';',
+      0, RawFlags or PZ_RAW_FULL, 4, FAIDir + '/pz_bench_sr.jpg', W, H);
+    BLog(Format('    export 25%% crop at 4x          %8.0f ms  -> %dx%d', [(NowSeconds - T0) * 1000, W, H]));
+    T0 := NowSeconds;
+    ExportImage(P.Path, '', 0, RawFlags or PZ_RAW_FULL, 2, FAIDir + '/pz_bench_sr2.jpg', W, H);
+    BLog(Format('    export whole photo at 2x       %8.0f ms  -> %dx%d', [(NowSeconds - T0) * 1000, W, H]));
+    DeleteFile(FAIDir + '/pz_bench_sr.jpg');
+    DeleteFile(FAIDir + '/pz_bench_sr2.jpg');
   end;
   PzAICloseThread;
   SetDenoise(False, 0, False);
