@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# Fetch and build the patched MNN (NeuroJSON/MNN v3.5-gpu-opt) into
+# third_party/mnn/ for Pizzicato's AI tools (`make AI=1`). Adapted from
+# siamize's scripts/fetch_mnn.sh, which documents the fork's fixes below;
+# Pizzicato uses MNN's OpenCL backend (and CPU) for 2-D image models.
+#
+# A machine that already has a staged MNN (e.g. siamize's third_party/mnn)
+# can instead symlink it:  ln -s <that dir> third_party/mnn
+#
+# Why a patched MNN: stock MNN 3.5.0 silently produces wrong logits on
+# SIAM-class workloads (>2 GB intermediate tensors after Conv3DTurn2D),
+# and decomposes Conv3D into thousands of geometry ops. The NeuroJSON/MNN
+# fork's `v3.5-gpu-opt` tag is the production ref: it carries the
+# 12-file int64 audit (fixing offset arithmetic on the hot paths), the
+# native OpenCL Conv3D/Deconv3D path, the MatMul LWS fix, the
+# siam_mnn_*_cl_error diagnostics siamize uses, the native Vulkan
+# Conv3D/Deconv3D path (used with MNN_VULKAN=1), and the vectorized Conv3D
+# and split-row LayerNorm kernels for both GPU backends.
+# `v3.5-vulkan-conv3d` is the same without those kernel optimizations,
+# `v3.5-opencl-conv3d` without the Vulkan work; `v3.5-int64fix` is the int64-only subset
+# (geometry-decomposed Conv3D, much slower). See tools/mnn_probe/patches/README.md.
+#
+# This script is heavyweight on first run (~15-20 min for cmake + make
+# of the MNN C++ tree). It caches build artifacts under
+# third_party/mnn-build/ so reruns skip the configure step. To force a
+# clean rebuild: `rm -rf third_party/mnn third_party/mnn-build`.
+#
+# Environment variables:
+#   MNN_TAG       Git tag/branch in NeuroJSON/MNN. Default v3.5-gpu-opt.
+#   MNN_OPENCL    1 (default) to enable MNN's OpenCL backend, 0 to skip.
+#   MNN_VULKAN    1 to enable MNN's Vulkan backend, 0 (default) to skip.
+#   MNN_JOBS      Parallel make jobs. Default $(nproc) on Linux, sysctl
+#                 hw.logicalcpu on macOS, else 4.
+#   FORCE         1 = remove third_party/mnn and rebuild even if it
+#                 already exists. Default 0 (idempotent).
+
+set -euo pipefail
+
+# MNN_REF can be a branch, tag, or commit SHA on NeuroJSON/MNN. The
+# default tag is the production ref: int64-overflow fixes + native OpenCL
+# and Vulkan Conv3D/Deconv3D + MatMul LWS fix + siam_mnn_*_cl_error
+# diagnostics. Pin MNN_REF=v3.5-int64fix for the slower int64-only subset.
+# MNN_TAG is accepted as a synonym for back-compat.
+MNN_REF="${MNN_REF:-${MNN_TAG:-v3.5-gpu-opt}}"
+MNN_TAG="$MNN_REF"   # used in stage-dir naming below
+MNN_OPENCL="${MNN_OPENCL:-1}"
+# MNN_VULKAN=1 also builds MNN's Vulkan backend. Opt-in (default 0) because the
+# Vulkan path is newer than OpenCL; it matters when you want the vendor-neutral
+# Vulkan ICD (NVIDIA / AMD / Intel / ARM) rather than the OpenCL ICD.
+# When enabled the same libMNN.so/.a carries both backends (SEP_BUILD=OFF).
+# We build MNN's BUFFER-based Vulkan backend (MNN_VULKAN_IMAGE=OFF): the
+# native Conv3D / Deconv3D executors live there, and the default IMAGE
+# backend has no 5D-tensor support worth using for SIAM.
+MNN_VULKAN="${MNN_VULKAN:-0}"
+# MNN_STATIC=1 builds libMNN.a instead of libMNN.so/.dylib. Pair with
+# the siamize CMakeLists.txt's static-detection branch to produce a
+# self-contained binary (no libMNN.so to ship next to siamize). The
+# static archive is larger on disk (no dead-code stripping at link
+# time inside the .a) but the final stripped siamize binary is
+# typically smaller than `siamize + libMNN.so` because the linker
+# can drop unreferenced MNN objects.
+MNN_STATIC="${MNN_STATIC:-0}"  # Pizzicato links the shared libMNN (rpath)
+FORCE="${FORCE:-0}"
+
+# Resolve the project root regardless of where the script is invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PZ_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MNN_STAGE="$PZ_ROOT/third_party/mnn"
+MNN_BUILD="$PZ_ROOT/third_party/mnn-build"
+
+OS_NAME="$(uname -s)"
+if [[ "$MNN_STATIC" == "1" ]]; then
+    case "$OS_NAME" in
+        Linux|Darwin)         LIB_NAME="libMNN.a" ;;
+        MINGW*|MSYS*|CYGWIN*) LIB_NAME="MNN.lib" ;;
+        *) echo "[fetch_mnn] Unsupported OS: $OS_NAME" >&2; exit 1 ;;
+    esac
+else
+    case "$OS_NAME" in
+        Linux)         LIB_NAME="libMNN.so" ;;
+        Darwin)        LIB_NAME="libMNN.dylib" ;;
+        MINGW*|MSYS*|CYGWIN*) LIB_NAME="MNN.dll" ;;
+        *) echo "[fetch_mnn] Unsupported OS: $OS_NAME" >&2; exit 1 ;;
+    esac
+fi
+
+if [[ -z "${MNN_JOBS:-}" ]]; then
+    if command -v nproc >/dev/null 2>&1; then
+        MNN_JOBS="$(nproc)"
+    elif [[ "$OS_NAME" == "Darwin" ]]; then
+        MNN_JOBS="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 4)"
+    else
+        MNN_JOBS=4
+    fi
+fi
+
+# Idempotency: skip if already staged with the SAME configuration unless
+# FORCE=1. The stamp records the knobs that change what libMNN contains, so
+# e.g. re-running with MNN_VULKAN=1 over an OpenCL-only stage rebuilds
+# instead of silently keeping a library without the Vulkan backend.
+BUILD_STAMP="ref=$MNN_REF opencl=$MNN_OPENCL vulkan=$MNN_VULKAN static=$MNN_STATIC"
+STAMP_FILE="$MNN_STAGE/.fetch_mnn_config"
+if [[ "$FORCE" == "0" && -f "$MNN_STAGE/include/MNN/Interpreter.hpp" && -f "$MNN_STAGE/lib/$LIB_NAME" \
+      && "$(cat "$STAMP_FILE" 2>/dev/null)" == "$BUILD_STAMP" ]]; then
+    echo "[fetch_mnn] $MNN_STAGE already populated (set FORCE=1 to rebuild)"
+    echo "[fetch_mnn]   include: $MNN_STAGE/include/MNN/Interpreter.hpp"
+    echo "[fetch_mnn]   lib:     $MNN_STAGE/lib/$LIB_NAME"
+    exit 0
+fi
+
+# Wipe the stage on rebuild but keep the build tree around so cmake
+# incremental rebuilds work when you bump MNN_TAG.
+rm -rf "$MNN_STAGE"
+mkdir -p "$MNN_STAGE/include" "$MNN_STAGE/lib"
+
+# Fetch the source if we don't have a clean checkout for this tag.
+mkdir -p "$MNN_BUILD"
+SRC_DIR="$MNN_BUILD/MNN-$MNN_TAG"
+ZIP_PATH="$MNN_BUILD/MNN-$MNN_TAG.zip"
+
+if [[ ! -d "$SRC_DIR" ]]; then
+    # GitHub's /archive/<ref>.zip endpoint accepts any ref kind
+    # (tag, branch, or commit SHA), unlike /archive/refs/tags/<tag>.zip
+    # which only resolves tag names. We rely on this for the default
+    # branch fetch and any user-supplied ref form.
+    URL="https://github.com/NeuroJSON/MNN/archive/${MNN_REF}.zip"
+    echo "[fetch_mnn] fetching $URL"
+    # Use curl with -L (follow redirects: GitHub redirects to codeload).
+    # -f fails on HTTP error so the script doesn't silently install a
+    # 404 page as the source archive.
+    curl -fL --retry 3 -o "$ZIP_PATH" "$URL"
+    echo "[fetch_mnn] extracting $ZIP_PATH"
+    # GitHub zip archives extract to a directory named MNN-<tagslug>/
+    # where tagslug is the tag name with v stripped from some auto
+    # archives but kept for explicit tags. Detect and rename if needed.
+    #
+    # Exclude apps/ (MNN's demo applications): we never build them
+    # (MNN_BUILD_DEMO=OFF) and some iOS asset files have non-ASCII names
+    # that Info-ZIP cannot create on macOS/APFS or Windows -- the write
+    # fails and unzip aborts with exit code 50. Dropping apps/ sidesteps
+    # that and trims the extracted tree. (-x patterns before -d exdir.)
+    unzip -q "$ZIP_PATH" -x '*/apps/*' -d "$MNN_BUILD"
+    if [[ ! -d "$SRC_DIR" ]]; then
+        # Try variants GitHub may use: MNN-<tag>, MNN-<tag-with-v-stripped>
+        for d in "$MNN_BUILD"/MNN-*/; do
+            mv "$d" "$SRC_DIR"
+            break
+        done
+    fi
+    if [[ ! -d "$SRC_DIR" ]]; then
+        echo "[fetch_mnn] FAIL: extraction did not produce $SRC_DIR" >&2
+        ls -la "$MNN_BUILD"/ >&2 || true
+        exit 1
+    fi
+fi
+
+# CMake configure + build the C++ library.
+CMAKE_BUILD="$SRC_DIR/build-pizzicato"
+# A forced rebuild reconfigures from scratch. CMake caches CMAKE_CXX_FLAGS and
+# the compiler in the build dir, so without wiping it a FORCE rebuild would
+# silently keep the previous run's flags -- e.g. toggling PZ_GLIBCXX_COMPAT
+# or CC/CXX would have no effect. (Non-forced reruns exit early above, so this
+# only fires when the user explicitly asked to rebuild.)
+if [[ "$FORCE" == "1" ]]; then
+    rm -rf "$CMAKE_BUILD"
+fi
+mkdir -p "$CMAKE_BUILD"
+
+if [[ "$MNN_STATIC" == "1" ]]; then
+    SHARED_LIBS_FLAG=OFF
+else
+    SHARED_LIBS_FLAG=ON
+fi
+
+CMAKE_FLAGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DMNN_BUILD_SHARED_LIBS=${SHARED_LIBS_FLAG}
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON  # needed when linking .a into a
+                                          # PIE executable (modern toolchain
+                                          # default) and harmless for .so.
+    -DMNN_SEP_BUILD=OFF         # fold every backend into libMNN.so/.a so
+                                # siamize links a single library; with
+                                # SEP_BUILD=ON the OpenCL backend lives in
+                                # a separate libMNN_CL.so that siamize
+                                # would need to dlopen explicitly. MNN's
+                                # own CMakeLists also force-sets SEP_BUILD
+                                # to OFF when SHARED_LIBS=OFF.
+    -DMNN_USE_THREAD_POOL=ON
+    -DMNN_OPENMP=OFF
+    -DMNN_BUILD_CONVERTER=OFF   # we only ship the runtime, not mnnconvert
+    -DMNN_BUILD_TOOLS=OFF
+    -DMNN_BUILD_TEST=OFF
+    -DMNN_BUILD_DEMO=OFF
+    -DMNN_BUILD_BENCHMARK=OFF
+    -DMNN_BUILD_TRAIN=OFF
+    -DMNN_BUILD_QUANTOOLS=OFF
+)
+# On Windows, build MNN with the static CRT (/MT), or static-linking it fails
+# with LNK2038 "RuntimeLibrary mismatch" + unresolved __imp_* CRT imports.
+# BOTH consumers use the static CRT: the CLI (siamize.exe) via
+# SIAMIZE_STATIC_LINK, and the MATLAB MEX (siamize_mex) -- CMakeLists also
+# forces /MT on the MEX under SIAMIZE_STATIC_LINK so the .mexw64 is
+# self-contained (Windows MATLAB ships its own MSVCRT). Ignored off Windows.
+case "$OS_NAME" in
+    MINGW*|MSYS*|CYGWIN*) CMAKE_FLAGS+=(-DMNN_WIN_RUNTIME_MT=ON) ;;
+esac
+
+if [[ "$MNN_OPENCL" == "1" ]]; then
+    CMAKE_FLAGS+=(-DMNN_OPENCL=ON)
+fi
+if [[ "$MNN_VULKAN" == "1" ]]; then
+    CMAKE_FLAGS+=(-DMNN_VULKAN=ON -DMNN_VULKAN_IMAGE=OFF)
+fi
+
+# Pin the compiler explicitly when CC / CXX are exported. cmake only reads
+# CC/CXX from the environment on a *fresh* build dir, which is fragile in CI
+# (a reused tree or a runner default can win); passing them as cmake flags is
+# unambiguous. Empty / unset CC/CXX -> cmake's default compiler (the existing
+# behavior for every other caller). This keeps the compiler from emitting
+# references to symbols introduced only in a newer libstdc++; the one symbol
+# that needs special handling regardless of compiler is pinned just below.
+if [[ -n "${CC:-}" ]]; then
+    CMAKE_FLAGS+=(-DCMAKE_C_COMPILER="$CC")
+fi
+if [[ -n "${CXX:-}" ]]; then
+    CMAKE_FLAGS+=(-DCMAKE_CXX_COMPILER="$CXX")
+fi
+
+# Opt-in (PZ_GLIBCXX_COMPAT=1): force std::condition_variable::wait (MNN's
+# thread pool, ThreadPool.cpp / WorkerThread.cpp) to its long-standing
+# GLIBCXX_3.4.11 symbol instead of the gcc-12 default @3.4.30. libMNN's
+# reference is unversioned, so the version is stamped at the final link against
+# the build host's libstdc++ -- on Ubuntu 22.04+ that's 3.4.30, which MATLAB's
+# bundled libstdc++ lacks, so an MNN-backed MEX built there won't load.
+# Force-including the directive (see scripts/glibcxx_compat.h) stamps 3.4.11.
+#
+# IMPORTANT: this is for libMNN that will be linked with DYNAMIC libstdc++
+# (the MATLAB/Octave MEX). A symbol-versioned reference CANNOT be satisfied by
+# `-static-libstdc++` (the CLI and docker binaries) -- the static archive has
+# no version nodes, so the link fails with "undefined reference to ...@3.4.11".
+# Hence opt-in and OFF by default: the CLI / docker / cpp-build-opencl builds
+# leave it unset and stay statically linkable; only the MEX libMNN build sets
+# it. Linux/ELF only (the -include flag is gcc/clang syntax; symbol is glibc++).
+if [[ "$OS_NAME" == "Linux" && "${PZ_GLIBCXX_COMPAT:-0}" == "1" ]]; then
+    CMAKE_FLAGS+=(-DCMAKE_CXX_FLAGS="-include $SCRIPT_DIR/glibcxx_compat.h")
+fi
+
+echo "[fetch_mnn] cmake configure (tag=$MNN_TAG, opencl=$MNN_OPENCL, vulkan=$MNN_VULKAN, static=$MNN_STATIC)"
+(cd "$CMAKE_BUILD" && cmake "${CMAKE_FLAGS[@]}" "$SRC_DIR")
+
+echo "[fetch_mnn] cmake build --target MNN -j$MNN_JOBS (the slow step, ~15-20 min)"
+# Use `cmake --build` rather than `make` so this works across generators:
+# Unix Makefiles (Linux/macOS), Ninja, and Visual Studio multi-config
+# (Windows, where `make` isn't available). --config Release is honored by
+# multi-config generators and ignored by single-config ones.
+cmake --build "$CMAKE_BUILD" --config Release --target MNN --parallel "$MNN_JOBS"
+
+# Locate a built artifact that may sit directly under the build dir
+# (single-config generators) or under a per-config subdir (multi-config
+# Visual Studio puts it in Release/).
+find_built() {
+    local name="$1" cand
+    for cand in "$CMAKE_BUILD/$name" "$CMAKE_BUILD/Release/$name"; do
+        if [[ -e "$cand" ]]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Stage headers + library at third_party/mnn/.
+echo "[fetch_mnn] staging headers"
+cp -r "$SRC_DIR/include/MNN" "$MNN_STAGE/include/"
+
+echo "[fetch_mnn] staging $LIB_NAME"
+case "$LIB_NAME" in
+    libMNN.a)
+        cp "$(find_built libMNN.a)" "$MNN_STAGE/lib/"
+        ;;
+    libMNN.so)
+        # The build may produce libMNN.so or libMNN.so.<version>; copy
+        # whatever exists and use the canonical name.
+        if src=$(find_built libMNN.so); then
+            cp "$src" "$MNN_STAGE/lib/"
+        else
+            so=$(ls "$CMAKE_BUILD"/libMNN.so* "$CMAKE_BUILD"/Release/libMNN.so* 2>/dev/null | head -1)
+            cp "$so" "$MNN_STAGE/lib/libMNN.so"
+        fi
+        ;;
+    libMNN.dylib)
+        cp "$(find_built libMNN.dylib)" "$MNN_STAGE/lib/"
+        ;;
+    MNN.dll)
+        cp "$(find_built MNN.dll)" "$MNN_STAGE/lib/"
+        # Windows also needs the import lib.
+        if src=$(find_built MNN.lib); then
+            cp "$src" "$MNN_STAGE/lib/"
+        fi
+        ;;
+    MNN.lib)
+        # Static Windows build: a single MNN.lib archive, no DLL.
+        cp "$(find_built MNN.lib)" "$MNN_STAGE/lib/"
+        ;;
+esac
+
+echo "$BUILD_STAMP" > "$STAMP_FILE"
+
+echo ""
+echo "[fetch_mnn] done"
+echo "[fetch_mnn]   include:  $MNN_STAGE/include/MNN/Interpreter.hpp"
+echo "[fetch_mnn]   library:  $MNN_STAGE/lib/$LIB_NAME"
+echo "[fetch_mnn]   tag:      $MNN_TAG"
+echo ""
+echo "Next:  make AI=1"

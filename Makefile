@@ -1,5 +1,7 @@
 # Pizzicato build. LAZDIR must point at a built Lazarus tree (gtk2 LCL).
 #   make              build ./pizzicato (and core/libpzcore.a, core/pzbench)
+#   make AI=1         ... with the AI tools (denoise, upscale, ...) on MNN/OpenCL;
+#                     needs third_party/mnn (tools/fetch_mnn.sh builds it)
 #   make pretty       format the sources (astyle for C, JCF for Pascal)
 #   make icons        redraw the toolbar icons (python3 + pycairo) into src/pzicons.inc
 #   make test         .picasa.ini round-trip test on copies of given files: INI="a.ini b.ini"
@@ -9,24 +11,35 @@ ARCH    = x86_64-linux
 UNITS   = -Fu$(LAZDIR)lcl/units/$(ARCH) -Fu$(LAZDIR)lcl/units/$(ARCH)/gtk2 \
           -Fu$(LAZDIR)components/lazutils/lib/$(ARCH) -Fusrc
 FPCOPT  = -MObjFPC -Scghi -O3 -CX -XX -Xs -vewn -dLCL -dLCLgtk2 -FUbuild -Flcore -Fllib
+AI     ?= 0
+MNN_DIR ?= $(CURDIR)/third_party/mnn
+ifeq ($(AI),1)
+FPCOPT += -Fl$(MNN_DIR)/lib -k-lMNN -k-rpath=$(MNN_DIR)/lib
+endif
+export AI MNN_DIR
 
 all: pizzicato
 
 core/libpzcore.a: core/pzcore.c core/pzcore.h
 	$(MAKE) -C core libpzcore.a pzbench
 
+core/libpzai.a: FORCE
+	$(MAKE) -C core libpzai.a $(if $(filter 1,$(AI)),pzai_cli)
+
+FORCE:
+
 lib/libraw_r.so:
 	mkdir -p lib build
 	ln -sf /usr/lib/x86_64-linux-gnu/libraw_r.so.20 $@
 
-pizzicato: lib/libraw_r.so core/libpzcore.a src/*.pas src/*.inc src/pizzicato.lpr
+pizzicato: lib/libraw_r.so core/libpzcore.a core/libpzai.a src/*.pas src/*.inc src/pizzicato.lpr
 	$(FPC) $(FPCOPT) $(UNITS) -o$(CURDIR)/$@ src/pizzicato.lpr
 
 clean:
 	rm -rf build/* pizzicato
 	$(MAKE) -C core clean
 
-.PHONY: all clean pretty pretty-c pretty-pas test icons
+.PHONY: all clean FORCE pretty pretty-c pretty-pas test icons
 
 icons:
 	python3 tools/make_icons.py

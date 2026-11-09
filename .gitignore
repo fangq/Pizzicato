@@ -7,3 +7,7 @@ lib/
 *.db
 *.db-*
 bench/*.txt
+core/pzai_cli
+core/.ai-*
+third_party/mnn
+third_party/mnn-build/

@@ -92,6 +92,7 @@ implementation
 uses
   SysUtils;
 
+{$linklib pzai}// before pzcore: it uses pzcore's functions
 {$linklib pzcore}
 {$linklib jpeg}
 {$linklib png16}
