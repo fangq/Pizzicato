@@ -38,6 +38,7 @@ type
     BtnAdd: TBitBtn;
     EdSearch: TEdit;
     ChkStar: TSpeedButton;   // 'starred only' toggle
+    ChkHidden: TSpeedButton; // 'show hidden photos' toggle
     ImgSearch, ImgSize: TImage;
     TabIcons: TImageList;
     FEffNames: TStringList;  // filter name of each effect button, by Tag
@@ -63,6 +64,7 @@ type
     { context menus }
     PmPhoto, PmView, PmFolder: TPopupMenu;
     MiOpen, MiZoom, MiPastePhoto, MiPasteView: TMenuItem;
+    MiHidePhoto, MiHideView: TMenuItem;
     MiFSelect, MiFHold, MiFExport, MiFDesc, MiFShow, MiFCopy, MiFRescan: TMenuItem;
     FMenuFolder: TPzFolder;
     FEditsClip: string;      // "Copy Edits": a filter chain
@@ -144,6 +146,12 @@ type
     procedure MOpenClick(Sender: TObject);
     procedure MDefaultAppClick(Sender: TObject);
     procedure MStarClick(Sender: TObject);
+    procedure MHideClick(Sender: TObject);
+    procedure MDeleteClick(Sender: TObject);
+    procedure HiddenChange(Sender: TObject);
+    procedure SetHideCaption(Mi: TMenuItem);
+    function ShownPos(P: TPzPhoto): Integer;
+    procedure DeletePhotos(L: TList);
     procedure MRotRClick(Sender: TObject);
     procedure MRotLClick(Sender: TObject);
     procedure MCopyEditsClick(Sender: TObject);
@@ -488,20 +496,32 @@ begin
   ChkStar.Spacing := 4;
   PzSetGlyph(ChkStar, 'star');
   ChkStar.OnClick := @StarChange;
+  ChkHidden := TSpeedButton.Create(Self);
+  ChkHidden.Parent := PnlTop;
+  ChkHidden.SetBounds(500, 6, 96, 28);
+  ChkHidden.Caption := 'Hidden';
+  ChkHidden.Hint := 'Show hidden photos too';
+  ChkHidden.ShowHint := True;
+  ChkHidden.GroupIndex := 2;
+  ChkHidden.AllowAllUp := True;
+  ChkHidden.Spacing := 4;
+  PzSetGlyph(ChkHidden, 'unhide');
+  ChkHidden.Down := Settings.ReadBool('view', 'showhidden', False);
+  ChkHidden.OnClick := @HiddenChange;
   ChkRawPreview := TCheckBox.Create(Self);
   ChkRawPreview.Parent := PnlTop;
-  ChkRawPreview.SetBounds(506, 10, 200, 22);
+  ChkRawPreview.SetBounds(608, 10, 200, 22);
   ChkRawPreview.Caption := 'RAW: use camera preview';
   ChkRawPreview.Font.Color := clPzHeader;
   ChkRawPreview.Checked := Settings.ReadBool('view', 'rawpreview', True);
   ChkRawPreview.OnChange := @RawModeChange;
-  ImgSize := AddIcon(PnlTop, 'thumbsize', 716, 10);
+  ImgSize := AddIcon(PnlTop, 'thumbsize', 818, 10);
   ImgSize.Hint := 'Thumbnail size';
   ImgSize.ShowHint := True;
   L := nil;
   TrkSize := TTrackBar.Create(Self);
   TrkSize.Parent := PnlTop;
-  TrkSize.SetBounds(740, 4, 180, 32);
+  TrkSize.SetBounds(842, 4, 180, 32);
   TrkSize.Min := 64;
   TrkSize.Max := 320;
   TrkSize.Frequency := 32;
@@ -510,7 +530,7 @@ begin
   TrkSize.TabStop := False;
   LblStatus := TLabel.Create(Self);
   LblStatus.Parent := PnlTop;
-  LblStatus.SetBounds(936, 12, 500, 20);
+  LblStatus.SetBounds(1038, 12, 500, 20);
   LblStatus.Font.Color := clPzSub;
 
   PnlLibrary := TPanel.Create(Self);
@@ -545,6 +565,7 @@ begin
   Grid.Parent := PnlLibrary;
   Grid.Align := alClient;
   Grid.ThumbSize := TrkSize.Position;
+  Grid.ShowHidden := ChkHidden.Down;
   Grid.OnOpen := @GridOpen;
   Grid.OnSelect := @GridSelect;
   Grid.OnTopFolder := @GridTopFolder;
@@ -1030,6 +1051,13 @@ end;
 procedure TMainForm.StarChange(Sender: TObject);
 begin
   Grid.StarOnly := ChkStar.Down;
+end;
+
+procedure TMainForm.HiddenChange(Sender: TObject);
+begin
+  Grid.ShowHidden := ChkHidden.Down;
+  if FEditMode then
+    Strip.Invalidate;
 end;
 
 procedure TMainForm.RawModeChange(Sender: TObject);
@@ -1876,6 +1904,10 @@ begin
     TRotLClick(nil)
   else if (ssCtrl in Shift) and (Key = VK_T) then
     TTagClick(nil)
+  else if (Key = VK_DELETE) and (Shift = []) and
+    ((FEditMode and not (ActiveControl is TCustomListBox)) or
+    (not FEditMode and (ActiveControl = Grid))) then
+    MDeleteClick(nil)
   else if FEditMode then
   begin
     if (ssCtrl in Shift) and (Key = VK_Z) then UndoClick(nil)
@@ -1943,6 +1975,7 @@ begin
   Settings.WriteInteger('window', 'tree', Tree.Width);
   Settings.WriteInteger('view', 'thumbsize', TrkSize.Position);
   Settings.WriteBool('view', 'rawpreview', ChkRawPreview.Checked);
+  Settings.WriteBool('view', 'showhidden', ChkHidden.Down);
   if not PnlRight.Visible then
     Settings.WriteInteger('view', 'rightpanel', 0)
   else if RightPages.ActivePage = TabTags then
@@ -2230,6 +2263,17 @@ begin
   end;
 end;
 
+{ a photo's place among the photos the library shows in its folder }
+function TMainForm.ShownPos(P: TPzPhoto): Integer;
+var
+  i: Integer;
+begin
+  Result := 1;
+  for i := 0 to P.Index - 1 do
+    if Grid.IsShown(P.Folder.Photo(i)) then
+      Inc(Result);
+end;
+
 procedure TMainForm.SelectionChanged;
 var
   L: TList;
@@ -2271,7 +2315,8 @@ begin
       LblSummary.Caption := Format(
         '%s  >  %s     %s     %d x %d pixels     %.1f MB     (%d of %d)%s',
         [Cur.Folder.Name, Cur.Name, FormatTaken(Cur.Taken), Cur.W,
-        Cur.H, Cur.Size / 1048576, Cur.Index + 1, Cur.Folder.Count,
+        Cur.H, Cur.Size / 1048576, ShownPos(Cur),
+        Max(Cur.Folder.ShownCount, ShownPos(Cur)),
         IfThen(Held.Count > 0, Format('     %d held', [Held.Count]), '')])
     else if L.Count = 0 then
       LblSummary.Caption :=
@@ -3144,6 +3189,7 @@ begin
   AddMI(PmPhoto, 'Rotate Counter-clockwise', 'rotleft', 'Ctrl+[', @MRotLClick);
   AddMI(PmPhoto, 'Add Tag…', 'tag', 'Ctrl+T', @TTagClick);
   AddMI(PmPhoto, 'Hold in Tray', 'pin', '', @PinClick);
+  MiHidePhoto := AddMI(PmPhoto, 'Hide', 'hide', '', @MHideClick);
   AddMI(PmPhoto, '-', '', '', nil);
   AddMI(PmPhoto, 'Copy Edits', '', '', @MCopyEditsClick);
   MiPastePhoto := AddMI(PmPhoto, 'Paste Edits', '', '', @MPasteEditsClick);
@@ -3152,6 +3198,7 @@ begin
   AddMI(PmPhoto, 'Export…', 'export', '', @MExportClick);
   AddMI(PmPhoto, 'Copy File Path', '', '', @MCopyPathClick);
   AddMI(PmPhoto, 'Show in File Manager', 'folder', '', @MShowFileClick);
+  AddMI(PmPhoto, 'Delete from Disk…', 'trash', 'Del', @MDeleteClick);
   AddMI(PmPhoto, '-', '', '', nil);
   AddMI(PmPhoto, 'Select All in Folder', 'library', 'Ctrl+A', @MSelectAllClick);
   AddMI(PmPhoto, 'Properties', 'info', '', @MPropsClick);
@@ -3166,6 +3213,7 @@ begin
   AddMI(PmView, 'Rotate Counter-clockwise', 'rotleft', 'Ctrl+[', @MRotLClick);
   AddMI(PmView, 'Add Tag…', 'tag', 'Ctrl+T', @TTagClick);
   AddMI(PmView, 'Hold in Tray', 'pin', '', @PinClick);
+  MiHideView := AddMI(PmView, 'Hide', 'hide', '', @MHideClick);
   AddMI(PmView, '-', '', '', nil);
   AddMI(PmView, 'Copy Edits', '', '', @MCopyEditsClick);
   MiPasteView := AddMI(PmView, 'Paste Edits', '', '', @MPasteEditsClick);
@@ -3175,6 +3223,7 @@ begin
   AddMI(PmView, 'Open with Default Application', '', '', @MDefaultAppClick);
   AddMI(PmView, 'Show in File Manager', 'folder', '', @MShowFileClick);
   AddMI(PmView, 'Copy File Path', '', '', @MCopyPathClick);
+  AddMI(PmView, 'Delete from Disk…', 'trash', 'Del', @MDeleteClick);
   AddMI(PmView, '-', '', '', nil);
   AddMI(PmView, 'Properties', 'info', '', @MPropsClick);
 
@@ -3248,6 +3297,7 @@ begin
     if not P.Selected then
       Grid.Select(P); // right-click on another photo selects it, as in Picasa
     MiPastePhoto.Enabled := FEditsClip <> '';
+    SetHideCaption(MiHidePhoto);
     PmPhoto.PopUp;
     Exit;
   end;
@@ -3267,6 +3317,7 @@ begin
   else
     MiZoom.Caption := 'Actual Pixels (1:1)';
   MiPasteView.Enabled := FEditsClip <> '';
+  SetHideCaption(MiHideView);
   PmView.PopUp;
 end;
 
@@ -3318,6 +3369,206 @@ begin
       OpenDocument(TPzPhoto(L[i]).Path);
   finally
     L.Free;
+  end;
+end;
+
+function AllHidden(L: TList): Boolean;
+var
+  i: Integer;
+begin
+  Result := L.Count > 0;
+  for i := 0 to L.Count - 1 do
+  begin
+    TPzPhoto(L[i]).Folder.EnsureIni;
+    Result := Result and TPzPhoto(L[i]).Hidden;
+  end;
+end;
+
+procedure TMainForm.SetHideCaption(Mi: TMenuItem);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    if AllHidden(L) then
+      Mi.Caption := 'Unhide'
+    else
+      Mi.Caption := 'Hide';
+  finally
+    L.Free;
+  end;
+end;
+
+{ like Picasa's Hide/Unhide: hidden=yes in .picasa.ini; hidden photos leave
+  the library unless 'Hidden' is down }
+procedure TMainForm.MHideClick(Sender: TObject);
+var
+  L: TList;
+  i: Integer;
+  ToHide: Boolean;
+  N: TPzPhoto;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    if L.Count = 0 then
+      Exit;
+    ToHide := not AllHidden(L);
+    { the editor moves on when its photo disappears from the library }
+    N := nil;
+    if FEditMode and ToHide and not Grid.ShowHidden then
+    begin
+      N := Grid.NextPhoto(Cur, 1);
+      if N = nil then
+        N := Grid.NextPhoto(Cur, -1);
+    end;
+    for i := 0 to L.Count - 1 do
+    begin
+      Lib.SetHidden(TPzPhoto(L[i]), ToHide);
+      EditsChanged(TPzPhoto(L[i]));
+      if ToHide and not Grid.ShowHidden then
+        Grid.Forget(TPzPhoto(L[i]));
+    end;
+    Grid.Relayout;
+    Strip.Invalidate;
+    Tray.Invalidate;
+    if N <> nil then
+      ShowPhoto(N)
+    else
+      SelectionChanged;
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MDeleteClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    DeletePhotos(L);
+  finally
+    L.Free;
+  end;
+end;
+
+{ Picasa's 'Delete from Disk': the files go to the desktop trash, from where
+  they can be restored (their .picasa.ini entries are kept for that) }
+procedure TMainForm.DeletePhotos(L: TList);
+var
+  i, k: Integer;
+  P, N: TPzPhoto;
+  Msg, Err, FirstErr: string;
+  Gone, Failed: TList;
+begin
+  if L.Count = 0 then
+    Exit;
+  if PzIniReadOnly then
+  begin
+    MessageDlg('Delete from Disk', 'Pizzicato is running read-only (--readonly); ' +
+      'nothing is deleted.', mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if L.Count = 1 then
+    Msg := Format('Move "%s" to the trash?', [TPzPhoto(L[0]).Name])
+  else
+    Msg := Format('Move these %d photos to the trash?', [L.Count]);
+  if MessageDlg('Delete from Disk', Msg + LineEnding + LineEnding +
+    'The files are removed from their folders; they can be restored ' +
+    'from the trash.', mtWarning, [mbYes, mbCancel], 0) <> mrYes then
+    Exit;
+  { where to go afterwards: the next photo that survives }
+  if FEditMode then
+    N := Cur
+  else
+    N := Grid.Selected;
+  if (N <> nil) and (L.IndexOf(N) < 0) then
+    N := nil;
+  if N <> nil then
+  begin
+    P := N;
+    repeat
+      N := Grid.NextPhoto(N, 1);
+    until (N = nil) or (L.IndexOf(N) < 0);
+    if N = nil then
+    begin
+      N := P;
+      repeat
+        N := Grid.NextPhoto(N, -1);
+      until (N = nil) or (L.IndexOf(N) < 0);
+    end;
+  end;
+  Gone := TList.Create;
+  Failed := TList.Create;
+  try
+    FirstErr := '';
+    Screen.Cursor := crHourGlass;
+    try
+      for i := 0 to L.Count - 1 do
+      begin
+        P := TPzPhoto(L[i]);
+        if PzTrashFile(P.Path, Err) then
+          Gone.Add(P)
+        else
+        begin
+          Failed.Add(P);
+          if FirstErr = '' then
+            FirstErr := Err;
+        end;
+      end;
+    finally
+      Screen.Cursor := crDefault;
+    end;
+    if (Failed.Count > 0) and (MessageDlg('Delete from Disk',
+      Format('%d of %d files could not be moved to the trash:',
+      [Failed.Count, L.Count]) + LineEnding + FirstErr + LineEnding +
+      LineEnding + 'Delete them permanently? This cannot be undone.',
+      mtError, [mbYes, mbNo], 0, mbNo) = mrYes) then
+      for i := 0 to Failed.Count - 1 do
+        if DeleteFile(TPzPhoto(Failed[i]).Path) then
+          Gone.Add(Failed[i]);
+    for i := 0 to Gone.Count - 1 do
+    begin
+      P := TPzPhoto(Gone[i]);
+      if P.Held then
+      begin
+        P.Held := False;
+        Held.Remove(P);
+      end;
+      for k := Cache.Count - 1 downto 0 do
+        if TViewEntry(Cache[k]).Photo = P then
+        begin
+          TViewEntry(Cache[k]).Free;
+          Cache.Delete(k);
+        end;
+      Grid.Forget(P);
+      Lib.RemovePhoto(P);
+    end;
+    if Gone.Count = 0 then
+      Exit;
+    FTreeDirty := True;
+    Grid.Relayout;
+    Strip.Invalidate;
+    if FEditMode and (Gone.IndexOf(Cur) >= 0) then
+    begin
+      if N <> nil then
+        ShowPhoto(N)
+      else
+      begin
+        Cur := nil;
+        SetEditMode(False);
+      end;
+    end
+    else if not FEditMode and (N <> nil) then
+      Grid.Select(N);
+    SelectionChanged;
+    UpdateStatus;
+  finally
+    Gone.Free;
+    Failed.Free;
   end;
 end;
 

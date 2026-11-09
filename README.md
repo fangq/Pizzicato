@@ -9,7 +9,9 @@ pixel kernels).
   show up in Pizzicato and the other way round.
 * **Picasa-style library**: every folder in one continuous scroll with folder
   headers, a year/folder tree, a thumbnail size slider, stars, and a
-  "Starred only" filter.
+  "Starred only" filter. Hide/Unhide (Picasa's `hidden=yes`) takes photos out
+  of the library, and the "Hidden" toggle shows them again with a crossed-eye
+  mark.
 * **Photo tray, as in Picasa**: the selection (click, Ctrl+click, Shift+click
   across folders, Ctrl+A for a folder) plus photos *held* with the pin. Star,
   rotate, tag and export act on everything in the tray. A blue strip sums it up
@@ -29,8 +31,13 @@ pixel kernels).
 * **Context menus**:
   * On a photo (library or full view): open, open with the default
     application, star, rotate, tag, hold, copy/paste/undo edits (Picasa's
-    "copy all effects"), export, copy the path, show in the file manager,
-    properties.
+    "copy all effects"), hide/unhide, export, copy the path, show in the file
+    manager, delete from disk, properties.
+  * **Delete from Disk** (also the Delete key) asks first, then moves the
+    files to the desktop trash with `gio trash`, so they can be restored; their
+    `.picasa.ini` entries are kept for that. Only when the trash cannot take a
+    file does it offer to delete it permanently, with No as the default.
+    `--readonly` refuses to delete.
   * On an album (folder list or folder header): select or hold all, export
     the album, edit its description (Picasa's `[Picasa] description=`), show it
     in the file manager, copy its path, rescan it.

@@ -42,6 +42,7 @@ type
     HasThumb: Boolean;   // a cached thumbnail exists in the DB
     { edits, mirrored from .picasa.ini }
     Star: Boolean;
+    Hidden: Boolean;     // Picasa's hidden=yes; also cached in the DB
     Filters: string;
     Redo: string;
     Rotate: Integer;
@@ -55,6 +56,7 @@ type
     Index: Integer;      // index inside folder
     Failed: Boolean;
     ViewPending: Boolean;
+    Removed: Boolean;    // deleted or gone from disk; kept alive until exit
     { selection (main thread) }
     Selected: Boolean;   // in the grid's selection
     Held: Boolean;       // pinned in the photo tray
@@ -89,6 +91,7 @@ type
     Top, Height: Integer;
     Visible: Boolean;
     FilterAll: Boolean;  // the folder itself matches the search
+    ShownCount: Integer; // photos the grid shows (filters, hidden)
     constructor Create;
     destructor Destroy; override;
     function Photo(i: Integer): TPzPhoto; inline;
@@ -151,6 +154,7 @@ type
   TPzScanEntry = record
     Name: string;
     Size, MTime: Int64;
+    Hidden: Boolean;
   end;
 
   TPzScanDir = class
@@ -204,6 +208,7 @@ type
     FOnScanDir: TNotifyEvent;
     FOnScanDone: TNotifyEvent;
     FFolderById: TList;
+    FGraveyard: TList;    // removed photos, freed at exit (jobs may hold them)
     procedure Exec(const SQL: string);
     procedure DeliverResults;
     procedure DeliverScan;
@@ -234,6 +239,10 @@ type
     procedure FlushPending;
     function PendingJobs: Integer;
     procedure AddRoot(const Dir: string);
+    { hide or unhide: the .picasa.ini key plus the cached DB flag }
+    procedure SetHidden(P: TPzPhoto; AValue: Boolean);
+    { forget a photo whose file was deleted }
+    procedure RemovePhoto(P: TPzPhoto);
     property OnResult: TPzResultEvent read FOnResult write FOnResult;
     property OnScanDir: TNotifyEvent read FOnScanDir write FOnScanDir;
     property OnScanDone: TNotifyEvent read FOnScanDone write FOnScanDone;
@@ -250,11 +259,13 @@ function FolderDateFromName(const Name: string; Fallback: Int64): Int64;
 function FormatTaken(T: Int64): string;
 function SplitTags(const S: string): TStringList;
 function JoinTags(L: TStrings): string;
+{ move a file to the desktop trash (gio, freedesktop.org spec) }
+function PzTrashFile(const Path: string; out Err: string): Boolean;
 
 implementation
 
 uses
-  DateUtils, Math;
+  DateUtils, Math, Process;
 
 var
   PZ_TRANSIENT: sqlite3_destructor_type;
@@ -437,6 +448,7 @@ begin
   begin
     P := Photo(i);
     P.Star := Ini.ReadValue(P.Name, 'star') = 'yes';
+    P.Hidden := Ini.ReadValue(P.Name, 'hidden') = 'yes';
     P.Filters := Ini.ReadValue(P.Name, 'filters');
     P.Redo := Ini.ReadValue(P.Name, 'redo');
     P.Rotate := ParseRotate(Ini.ReadValue(P.Name, 'rotate'));
@@ -459,6 +471,10 @@ begin
     Ini.WriteValue(P.Name, 'star', 'yes')
   else
     Ini.DeleteKey(P.Name, 'star');
+  if P.Hidden then
+    Ini.WriteValue(P.Name, 'hidden', 'yes')
+  else
+    Ini.DeleteKey(P.Name, 'hidden');
   Ini.WriteValue(P.Name, 'filters', P.Filters);
   Ini.WriteValue(P.Name, 'redo', P.Redo);
   Ini.WriteValue(P.Name, 'rotate', RotateToString(P.Rotate));
@@ -639,6 +655,33 @@ begin
     sqlite3_close(FDB);
 end;
 
+{ the photos a folder's .picasa.ini marks hidden=yes (nil if none) }
+function ReadHiddenNames(const Dir: string): TStringList;
+var
+  Ini: TPzIni;
+  i: Integer;
+begin
+  Result := nil;
+  if not FileExists(Dir + '/.picasa.ini') then
+    Exit;
+  Ini := TPzIni.Create(Dir + '/.picasa.ini');
+  try
+    Ini.Load;
+    for i := 0 to Ini.Count - 1 do
+      if Ini.ReadValue(Ini.Sections[i].Name, 'hidden') = 'yes' then
+      begin
+        if Result = nil then
+        begin
+          Result := TStringList.Create;
+          Result.Sorted := True;
+        end;
+        Result.Add(Ini.Sections[i].Name);
+      end;
+  finally
+    Ini.Free;
+  end;
+end;
+
 { TPzScanner }
 
 constructor TPzScanner.Create(ALib: TPzLibrary; ARoots, AKnown: TStrings);
@@ -673,6 +716,7 @@ var
   DirSt: Stat;
   IsDir, IsReg: Boolean;
   Known: string;
+  Hid: TStringList;
 begin
   if Terminated or (Depth > 12) then
     Exit;
@@ -725,6 +769,7 @@ begin
       begin
         Files.Sort;
         SetLength(SD.Entries, Files.Count);
+        Hid := ReadHiddenNames(Dir);
         for i := 0 to Files.Count - 1 do
         begin
           SD.Entries[i].Name := Files[i];
@@ -733,7 +778,9 @@ begin
             SD.Entries[i].Size := St.st_size;
             SD.Entries[i].MTime := St.st_mtime;
           end;
+          SD.Entries[i].Hidden := (Hid <> nil) and (Hid.IndexOf(Files[i]) >= 0);
         end;
+        Hid.Free;
       end;
       FLib.FQLock.Enter;
       FLib.FScanResults.Add(SD);
@@ -777,6 +824,7 @@ begin
   FResults := TList.Create;
   FScanResults := TList.Create;
   Folders := TList.Create;
+  FGraveyard := TList.Create;
   FFolderById := TList.Create;
   Roots := TStringList.Create;
   FGenLimit := 6;
@@ -790,8 +838,14 @@ begin
   Exec('PRAGMA cache_size=-65536');
   Exec('CREATE TABLE IF NOT EXISTS folders(id INTEGER PRIMARY KEY, path TEXT UNIQUE, mtime INTEGER)');
   Exec('CREATE TABLE IF NOT EXISTS photos(id INTEGER PRIMARY KEY, folder INTEGER, name TEXT, size INTEGER, '
-    + 'mtime INTEGER, w INTEGER, h INTEGER, taken INTEGER, fmt INTEGER, camera TEXT, UNIQUE(folder,name))');
+    + 'mtime INTEGER, w INTEGER, h INTEGER, taken INTEGER, fmt INTEGER, camera TEXT, '
+    + 'hidden INTEGER DEFAULT 0, UNIQUE(folder,name))');
   Exec('CREATE TABLE IF NOT EXISTS thumbs(id INTEGER PRIMARY KEY, data BLOB)');
+  { databases from before 'hidden': add it, and re-list every folder once so
+    the scanner picks the flags up from the .picasa.ini files }
+  if sqlite3_exec(FDB, 'ALTER TABLE photos ADD COLUMN hidden INTEGER DEFAULT 0',
+    nil, nil, nil) = SQLITE_OK then
+    Exec('UPDATE folders SET mtime=0');
 end;
 
 destructor TPzLibrary.Destroy;
@@ -803,6 +857,9 @@ begin
   for i := 0 to Folders.Count - 1 do
     TPzFolder(Folders[i]).Free;
   Folders.Free;
+  for i := 0 to FGraveyard.Count - 1 do
+    TPzPhoto(FGraveyard[i]).Free;
+  FGraveyard.Free;
   FFolderById.Free;
   for i := 0 to FViewQ.Count - 1 do TPzJob(FViewQ[i]).Free;
   for i := 0 to FProbeQ.Count - 1 do TPzJob(FProbeQ[i]).Free;
@@ -823,6 +880,86 @@ begin
   FQLock.Free;
   FDBLock.Free;
   inherited Destroy;
+end;
+
+procedure TPzLibrary.SetHidden(P: TPzPhoto; AValue: Boolean);
+begin
+  P.Folder.EnsureIni;
+  P.Hidden := AValue;
+  P.Folder.SavePhotoEdits(P);
+  FDBLock.Enter;
+  try
+    Exec(Format('UPDATE photos SET hidden=%d WHERE id=%d', [Ord(AValue), P.Id]));
+  finally
+    FDBLock.Leave;
+  end;
+end;
+
+procedure TPzLibrary.RemovePhoto(P: TPzPhoto);
+var
+  F: TPzFolder;
+  i: Integer;
+begin
+  F := P.Folder;
+  if P.Removed or (F = nil) then
+    Exit;
+  i := F.Photos.IndexOf(P);
+  if i >= 0 then
+    F.Photos.Delete(i);
+  for i := 0 to F.Count - 1 do
+    F.Photo(i).Index := i;
+  P.Removed := True;
+  P.Selected := False;
+  FGraveyard.Add(P);
+  FDBLock.Enter;
+  try
+    Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
+    Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
+  finally
+    FDBLock.Leave;
+  end;
+end;
+
+function PzTrashFile(const Path: string; out Err: string): Boolean;
+var
+  Pr: TProcess;
+  Buf: string;
+  n: Integer;
+begin
+  Err := '';
+  Result := False;
+  Pr := TProcess.Create(nil);
+  try
+    Pr.Executable := ExeSearch('gio', GetEnvironmentVariable('PATH'));
+    if Pr.Executable = '' then
+    begin
+      Err := 'the "gio" tool (GLib) was not found';
+      Exit;
+    end;
+    Pr.Parameters.Add('trash');
+    Pr.Parameters.Add('--');
+    Pr.Parameters.Add(Path);
+    Pr.Options := [poUsePipes, poStderrToOutPut, poNoConsole];
+    try
+      Pr.Execute;
+      SetLength(Buf, 4096);
+      repeat
+        n := Pr.Output.Read(Buf[1], Length(Buf));
+        if n > 0 then
+          Err := Err + Copy(Buf, 1, n);
+      until n <= 0;
+      Pr.WaitOnExit;
+      Result := (Pr.ExitStatus = 0) and not FileExists(Path);
+      Err := Trim(Err);
+      if not Result and (Err = '') then
+        Err := Format('gio trash failed (exit %d)', [Pr.ExitStatus]);
+    except
+      on E: Exception do
+        Err := E.Message;
+    end;
+  finally
+    Pr.Free;
+  end;
 end;
 
 procedure TPzLibrary.Exec(const SQL: string);
@@ -911,7 +1048,7 @@ begin
     end;
     { photos, already in display order }
     if sqlite3_prepare_v2(FDB,
-      'SELECT id,folder,name,size,mtime,w,h,taken,fmt,camera FROM photos ORDER BY folder,name',
+      'SELECT id,folder,name,size,mtime,w,h,taken,fmt,camera,hidden FROM photos ORDER BY folder,name',
       -1, @St, nil) = SQLITE_OK then
     begin
       while sqlite3_step(St) = SQLITE_ROW do
@@ -932,6 +1069,7 @@ begin
         P.Fmt := sqlite3_column_int(St, 8);
         P.IsRaw := P.Fmt = PZ_FMT_RAW;
         P.Camera := StrPas(sqlite3_column_text(St, 9));
+        P.Hidden := sqlite3_column_int(St, 10) <> 0;
         P.HasThumb := (P.Id <= MaxId) and HasT[P.Id];
         P.Index := F.Photos.Count;
         F.Photos.Add(P);
@@ -1221,6 +1359,12 @@ begin
         begin
           P := TPzPhoto(Old.Objects[k]);
           Old.Delete(k);
+          if P.Hidden <> D.Entries[i].Hidden then
+          begin
+            P.Hidden := D.Entries[i].Hidden;
+            Exec(Format('UPDATE photos SET hidden=%d WHERE id=%d',
+              [Ord(P.Hidden), P.Id]));
+          end;
           Changed := (P.Size <> D.Entries[i].Size) or (P.MTime <> D.Entries[i].MTime);
           if Changed then
           begin
@@ -1247,14 +1391,16 @@ begin
           P.MTime := D.Entries[i].MTime;
           P.Fmt := FormatFromExt(P.Name);
           P.IsRaw := P.Fmt = PZ_FMT_RAW;
+          P.Hidden := D.Entries[i].Hidden;
           sqlite3_prepare_v2(FDB,
-            'INSERT OR REPLACE INTO photos(folder,name,size,mtime,w,h,taken,fmt) VALUES(?,?,?,?,0,0,0,?)',
+            'INSERT OR REPLACE INTO photos(folder,name,size,mtime,w,h,taken,fmt,hidden) VALUES(?,?,?,?,0,0,0,?,?)',
             -1, @St, nil);
           sqlite3_bind_int64(St, 1, F.Id);
           sqlite3_bind_text(St, 2, PAnsiChar(P.Name), -1, PZ_TRANSIENT);
           sqlite3_bind_int64(St, 3, P.Size);
           sqlite3_bind_int64(St, 4, P.MTime);
           sqlite3_bind_int64(St, 5, P.Fmt);
+          sqlite3_bind_int(St, 6, Ord(P.Hidden));
           sqlite3_step(St);
           sqlite3_finalize(St);
           P.Id := sqlite3_last_insert_rowid(FDB);
@@ -1269,12 +1415,15 @@ begin
         Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
         Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
         P.Folder := F;
+        P.Removed := True;
+        FGraveyard.Add(P);
       end;
       F.Photos.Free;
       F.Photos := NewList;
       NewList := nil;
       if F.IniLoaded then
       begin
+        F.FlushIni; // don't drop edits not yet written
         FreeAndNil(F.Ini);
         F.IniLoaded := False;
       end;

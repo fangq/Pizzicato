@@ -42,6 +42,7 @@ type
     FSel: TList;          // the selection, in click order
     FFolderIcon: TBitmap;
     FStarOnly: Boolean;
+    FShowHidden: Boolean;
     FFilter: string;
     FOnOpen: TPzPhotoEvent;
     FOnSelect: TPzPhotoEvent;
@@ -52,6 +53,7 @@ type
     procedure ScrollChange(Sender: TObject);
     procedure SetThumbSize(AValue: Integer);
     procedure SetStarOnly(AValue: Boolean);
+    procedure SetShowHidden(AValue: Boolean);
     procedure SetFilter(const AValue: string);
     function CellRect(F: TPzFolder; i: Integer): TRect;
     function PhotoVisible(P: TPzPhoto): Boolean;
@@ -76,6 +78,7 @@ type
     procedure EnsureVisible(P: TPzPhoto);
     procedure Select(P: TPzPhoto; Mode: TPzSelMode = smReplace);
     procedure ClearSelection;
+    procedure Forget(P: TPzPhoto);  // drop references to a removed photo
     procedure SelectAllInFolder(F: TPzFolder);
     function OrderKey(P: TPzPhoto): Int64;
     procedure SetFolderIcon(B: TBitmap);
@@ -91,6 +94,7 @@ type
     property ThumbSize: Integer read FThumbSize write SetThumbSize;
     property Selected: TPzPhoto read FSelected;
     property StarOnly: Boolean read FStarOnly write SetStarOnly;
+    property ShowHidden: Boolean read FShowHidden write SetShowHidden;
     property Filter: string read FFilter write SetFilter;
     property OnOpen: TPzPhotoEvent read FOnOpen write FOnOpen;
     property OnSelect: TPzPhotoEvent read FOnSelect write FOnSelect;
@@ -234,6 +238,8 @@ type
 
 function ImageToBitmap(const Img: Tpz_image): TBitmap;
 procedure DrawStar(C: TCanvas; X, Y, R: Integer);
+{ a crossed-out eye: the photo is hidden (shown only with 'show hidden') }
+procedure DrawHiddenMark(C: TCanvas; X, Y, R: Integer);
 
 implementation
 
@@ -252,6 +258,26 @@ begin
   Raw.Data := PByte(Img.px);
   Raw.DataSize := PtrUInt(Img.w) * PtrUInt(Img.h) * 4;
   Result.LoadFromRawImage(Raw, False);
+end;
+
+procedure DrawHiddenMark(C: TCanvas; X, Y, R: Integer);
+begin
+  C.Pen.Style := psSolid;
+  C.Brush.Style := bsSolid;
+  C.Brush.Color := TColor($404040);
+  C.Pen.Color := TColor($404040);
+  C.Ellipse(X - R - 3, Y - R - 3, X + R + 4, Y + R + 4);
+  C.Pen.Color := TColor($F0F0F0);
+  C.Pen.Width := 1;
+  C.Brush.Style := bsClear;
+  C.Ellipse(X - R, Y - R div 2, X + R + 1, Y + R div 2 + 1);
+  C.Brush.Style := bsSolid;
+  C.Brush.Color := TColor($F0F0F0);
+  C.Ellipse(X - 2, Y - 2, X + 3, Y + 3);
+  C.Pen.Color := TColor($6060FF); // red slash (BGR)
+  C.Pen.Width := 2;
+  C.Line(X - R, Y + R, X + R, Y - R);
+  C.Pen.Width := 1;
 end;
 
 procedure DrawStar(C: TCanvas; X, Y, R: Integer);
@@ -341,6 +367,14 @@ begin
   SetScrollY(0);
 end;
 
+procedure TPzGrid.SetShowHidden(AValue: Boolean);
+begin
+  if FShowHidden = AValue then
+    Exit;
+  FShowHidden := AValue;
+  Relayout;
+end;
+
 procedure TPzGrid.SetFilter(const AValue: string);
 begin
   if FFilter = AValue then
@@ -353,7 +387,8 @@ end;
 function TPzGrid.IsShown(P: TPzPhoto): Boolean;
 begin
   Result := (P <> nil) and (not FStarOnly or P.Star) and
-    ((FFilter = '') or P.FilterHit or ((P.Folder <> nil) and P.Folder.FilterAll));
+    (FShowHidden or not P.Hidden) and ((FFilter = '') or P.FilterHit or
+    ((P.Folder <> nil) and P.Folder.FilterAll));
 end;
 
 procedure TPzGrid.Relayout;
@@ -387,7 +422,7 @@ begin
     end;
     if FStarOnly then
       F.EnsureIni;
-    if FStarOnly or not F.FilterAll then
+    if FStarOnly or not F.FilterAll or not FShowHidden then
     begin
       n := 0;
       for k := 0 to F.Count - 1 do
@@ -396,6 +431,7 @@ begin
     end
     else
       n := F.Count;
+    F.ShownCount := n;
     if n = 0 then
       Continue;
     F.Visible := True;
@@ -615,10 +651,14 @@ begin
         C.Font.Style := [];
         C.Font.Height := -12;
         C.Font.Color := clPzSub;
-        if F.Description <> '' then
-          Sub := Format('%d photos   —  %s', [F.Count, F.Description])
+        if F.ShownCount < F.Count then
+          Sub := Format('%d of %d photos', [F.ShownCount, F.Count])
         else
-          Sub := Format('%d photos   %s', [F.Count, ExtractFileDir(F.Path)]);
+          Sub := Format('%d photos', [F.Count]);
+        if F.Description <> '' then
+          Sub := Sub + '   —  ' + F.Description
+        else
+          Sub := Sub + '   ' + ExtractFileDir(F.Path);
         C.TextOut(j + C.TextWidth(Hdr) * 15 div 12 + 24, F.Top -
           FScrollY + 13, Sub);
         C.Pen.Color := TColor($3A3A3A);
@@ -691,6 +731,8 @@ begin
         end;
         if P.Star then
           DrawStar(C, R.Left + 10, R.Bottom - 10, 7);
+        if P.Hidden then
+          DrawHiddenMark(C, R.Left + 12, R.Top + 12, 7);
         if P.IsRaw and (FThumbSize >= 96) then
         begin
           C.Font.Height := -9;
@@ -783,6 +825,16 @@ begin
     TPzPhoto(FSel[i]).Selected := False;
   FSel.Clear;
   Invalidate;
+end;
+
+procedure TPzGrid.Forget(P: TPzPhoto);
+begin
+  FSel.Remove(P);
+  P.Selected := False;
+  if FSelected = P then
+    FSelected := nil;
+  if FAnchor = P then
+    FAnchor := nil;
 end;
 
 function TPzGrid.HitFolder(X, Y: Integer): TPzFolder;
@@ -1476,6 +1528,8 @@ begin
     end;
     if P.Star then
       DrawStar(C, R.Left + 8, R.Bottom - 8, 5);
+    if P.Hidden then
+      DrawHiddenMark(C, R.Left + 9, R.Top + 9, 5);
   end;
 end;
 

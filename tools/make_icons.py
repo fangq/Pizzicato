@@ -531,6 +531,48 @@ def _(c):
 
 # ---------- output ----------
 
+
+def eye(c, stops=BLUE):
+    c.move_to(10, 64)
+    c.curve_to(36, 26, 92, 26, 118, 64)
+    c.curve_to(92, 102, 36, 102, 10, 64)
+    c.close_path()
+    pale(c, stops)
+    stroke(c, stops)
+    c.arc(64, 64, 18, 0, 2 * math.pi)
+    c.set_source(grad(stops, 46, 46, 82, 82))
+    c.fill()
+    dot(c, 70, 58, 5, [(0, (1, 1, 1)), (1, (1, 1, 1))])
+
+
+@icon("hide")  # hide a photo: a crossed-out eye
+def _(c):
+    eye(c)
+    bar(c, 22, 110, 106, 18, RED, W * 1.1)
+
+
+@icon("unhide")  # show hidden photos / unhide: an open eye
+def _(c):
+    eye(c, GREEN)
+
+
+@icon("trash")  # delete from disk: a waste bin
+def _(c):
+    rrect(c, 22, 22, 84, 14, 6)
+    c.set_source(grad(RED, 22, 22, 106, 36))
+    c.fill()
+    bar(c, 50, 14, 78, 14, RED, W * 0.8)
+    c.move_to(30, 42)
+    c.line_to(98, 42)
+    c.line_to(90, 116)
+    c.line_to(38, 116)
+    c.close_path()
+    pale(c, RED)
+    stroke(c, RED)
+    for x in (52, 64, 76):
+        bar(c, x, 56, x, 102, RED, W * 0.6)
+
+
 def render(name, size):
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     c = cairo.Context(surf)
