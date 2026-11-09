@@ -85,6 +85,7 @@ function pz_version: PAnsiChar; cdecl; external;
 
 { Helpers }
 function pz_save_png_gray(path: PAnsiChar; w, h: cint; px: PByte): cint; cdecl; external;
+function pz_sha256_file(path: PAnsiChar; hex: PAnsiChar): cint; cdecl; external;
 procedure pz_dot_i8(m: PShortInt; scale: PSingle; n, d: cint; q: PSingle; out_: PSingle);
   cdecl; external;
 procedure PzInit(out img: Tpz_image);

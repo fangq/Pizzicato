@@ -96,14 +96,27 @@ The build produces `./pizzicato`. The C core and its benchmark tool are in
 
     tools/fetch_mnn.sh       # builds MNN with OpenCL and MNN-LLM into third_party/mnn
                              # (or: ln -s <an MNN already staged> third_party/mnn)
-    tools/fetch_models.sh    # downloads + converts the models (needs `pip install MNN onnx`)
     make AI=1
+
+The models are not in the repository. Each feature downloads its model the
+first time it is used (or from **AI Models...** in the top bar). These are
+zip bundles of the converted `.mnn` files, 2-280 MB each and 975 MB for all
+seven. They are fetched with `curl` from `PZ_MODELS_URL` (the zip's name is
+appended, so a NeuroJSON-style `...&file=` prefix works), checked against
+the SHA-256 in `src/pzmodels.pas`, and unpacked into the model directory. An
+interrupted download resumes.
+
+Making the bundles (maintainers):
+
+    tools/fetch_models.sh    # downloads the upstream ONNX/weights + converts them
+                             # (needs `pip install MNN onnx`; see below for SmolVLM)
+    tools/package_models.sh  # zips them per feature, prints the table for src/pzmodels.pas
 
 The scene captioner is exported by MNN-LLM's `llmexport.py`, which needs
 torch (the CPU build will do) and transformers 4.5x:
 `PZ_LLM_PYTHON=/path/to/venv/bin/python tools/fetch_models.sh smolvlm`.
-It also needs an MNN built with MNN-LLM (`fetch_mnn.sh`'s default,
-`MNN_LLM=1`). An MNN without it still runs every other AI tool.
+Running it needs an MNN built with MNN-LLM (`fetch_mnn.sh`'s default,
+`MNN_LLM=1`). Without MNN-LLM, every other AI tool still works.
 
 The models go to `~/.local/share/pizzicato/models` (`PZ_MODELS` overrides).
 GPU auto-tuning caches go next to the thumbnail DB. `PZ_AI_GPU=1` or

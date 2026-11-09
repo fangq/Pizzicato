@@ -61,6 +61,9 @@ void pz_free_mem(void* p);
 int  pz_save_jpeg(const char* path, const pz_image* img, int quality);
 /* an 8-bit grayscale PNG (masks); 0 on success */
 int  pz_save_png_gray(const char* path, int w, int h, const unsigned char* px);
+/* SHA-256 of a file as 64 lowercase hex digits plus a NUL (checks model
+   downloads); 0 on success */
+int  pz_sha256_file(const char* path, char hex[65]);
 
 /* ---- filters (all in place unless stated) ---- */
 typedef struct {

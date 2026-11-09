@@ -105,7 +105,7 @@ begin
   else if not FileExists(FaceFile('face_yunet.mnn')) or not
     FileExists(FaceFile('face_sface.mnn')) then
     Why := 'The face models are not installed in ' + PzAIModelDir +
-      '. Run tools/fetch_models.sh faces to download them.';
+      '. Download them with AI Models... (top bar).';
   Result := Why = '';
 end;
 

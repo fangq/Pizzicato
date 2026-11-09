@@ -73,7 +73,7 @@ begin
   else if not FileExists(PzCaptionModelDir + '/config.json') or not
     FileExists(PzCaptionModelDir + '/visual.mnn') then
     Why := Format('The scene captioner is not installed in %s.' +
-      LineEnding + 'Run tools/fetch_models.sh smolvlm to make it.', [PzCaptionModelDir]);
+      LineEnding + 'Download it with AI Models... (top bar).', [PzCaptionModelDir]);
   Result := Why = '';
 end;
 

@@ -199,7 +199,7 @@ begin
     Why := 'This Pizzicato was built without AI support (make AI=1).'
   else if not FileExists(PzAIModelFile(K)) then
     Why := Format('The model %s is not installed in %s.' + LineEnding +
-      'Run tools/fetch_models.sh to download it.', [MODEL_FILES[K], PzAIModelDir]);
+      'Download it with AI Models... (top bar).', [MODEL_FILES[K], PzAIModelDir]);
   Result := Why = '';
 end;
 

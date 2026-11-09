@@ -113,7 +113,7 @@ begin
       if not FileExists(ClipFile(F[i])) then
       begin
         Why := Format('The search model %s is not installed in %s.' +
-          LineEnding + 'Run tools/fetch_models.sh clip to download it.',
+          LineEnding + 'Download it with AI Models... (top bar).',
           [F[i], PzAIModelDir]);
         Break;
       end;

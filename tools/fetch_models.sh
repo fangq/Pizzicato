@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Download Pizzicato's AI models (ONNX, from their public releases), check
-# their sha256, and convert them to fp16 .mnn with MNN's converter
-# (`pip install MNN` provides `mnnconvert`).
+# Maintainers: download Pizzicato's AI models (ONNX, from their public
+# releases), check their sha256, and convert them to fp16 .mnn with MNN's
+# converter (`pip install MNN` provides `mnnconvert`). tools/package_models.sh
+# then zips them into the bundles the app downloads on first use; users do
+# not need this script.
 #
 #   tools/fetch_models.sh [name ...]      # default: all
 #

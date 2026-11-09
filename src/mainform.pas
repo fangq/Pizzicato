@@ -12,7 +12,7 @@ uses
   LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
   Buttons, ImgList, gdk2,
   pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai,
-  pzsearch, pzfaces, pzcaption, md5;
+  pzsearch, pzfaces, pzcaption, pzmodels, md5;
 
 type
   TViewEntry = class
@@ -41,6 +41,7 @@ type
     ChkStar: TSpeedButton;   // 'starred only' toggle
     ChkHidden: TSpeedButton; // 'show hidden photos' toggle
     ChkSmart: TSpeedButton;  // search by description (CLIP)
+    BtnModels: TButton;      // AI Models... (download the models)
     TmrSmart: TTimer;
     ClipIdx: TPzClipIndex;
     ClipText: TPzClipText;
@@ -156,6 +157,9 @@ type
     procedure StartClipIndex;
     procedure StartFaceIndex;
     procedure StartCaptionIndex;
+    procedure StartBackgroundAI;
+    function GetModel(const Bundle, Feature, Why: string): Boolean;
+    procedure ModelsClick(Sender: TObject);
     procedure LoadCaptions;
     function PhotoMap: TList;
     procedure RebuildPeople;
@@ -602,6 +606,14 @@ begin
   ChkRawPreview.Font.Color := clPzHeader;
   ChkRawPreview.Checked := Settings.ReadBool('view', 'rawpreview', True);
   ChkRawPreview.OnChange := @RawModeChange;
+  BtnModels := TButton.Create(Self);
+  BtnModels.Parent := PnlTop;
+  BtnModels.SetBounds(816, 6, 110, 28);
+  BtnModels.Caption := 'AI Models...';
+  BtnModels.Hint := 'Download the models the AI tools need';
+  BtnModels.ShowHint := True;
+  BtnModels.Visible := PzAIAvailable;
+  BtnModels.OnClick := @ModelsClick;
   ImgSize := AddIcon(PnlTop, 'thumbsize', 818, 10);
   ImgSize.Hint := 'Thumbnail size';
   ImgSize.ShowHint := True;
@@ -1138,6 +1150,43 @@ begin
   RebuildPeople;
 end;
 
+{ ---------------- AI models ---------------- }
+
+{ the background indexers whose models are there }
+procedure TMainForm.StartBackgroundAI;
+begin
+  if ChkSmart.Down then
+    StartClipIndex;
+  StartFaceIndex;
+  StartCaptionIndex;
+  if ClipIdx <> nil then
+    ClipIdx.Kick;
+  if FaceIdx <> nil then
+    FaceIdx.Kick;
+  if CapIdx <> nil then
+    CapIdx.Kick;
+end;
+
+{ a feature found its model missing (Why): offer to download it; True
+  when it is installed now }
+function TMainForm.GetModel(const Bundle, Feature, Why: string): Boolean;
+begin
+  if not PzAIAvailable or FBench then
+  begin
+    MessageDlg(Feature, Why, mtInformation, [mbOK], 0);
+    Exit(False);
+  end;
+  Result := PzModelsDialog([Bundle], Feature +
+    ' needs its model, which is not installed yet.');
+  StartBackgroundAI;
+end;
+
+procedure TMainForm.ModelsClick(Sender: TObject);
+begin
+  PzModelsDialog([]);
+  StartBackgroundAI;
+end;
+
 { ---------------- scene summaries ---------------- }
 
 procedure TMainForm.StartCaptionIndex;
@@ -1467,10 +1516,10 @@ procedure TMainForm.SmartClick(Sender: TObject);
 var
   Why: string;
 begin
-  if ChkSmart.Down and not PzClipReady(Why) then
+  if ChkSmart.Down and not PzClipReady(Why) and not
+    GetModel('search', 'Smart search', Why) then
   begin
     ChkSmart.Down := False;
-    MessageDlg('Smart search', Why, mtInformation, [mbOK], 0);
     Exit;
   end;
   if ChkSmart.Down then
@@ -2130,11 +2179,8 @@ var
 begin
   if Cur = nil then
     Exit;
-  if not PzAIReady(akDenoise, Why) then
-  begin
-    MessageDlg('AI Denoise', Why, mtInformation, [mbOK], 0);
+  if not PzAIReady(akDenoise, Why) and not GetModel('denoise', 'AI Denoise', Why) then
     Exit;
-  end;
   if not DenoiseOf(Cur.Filters, A, K) then
     SetDenoise(True, 0.8, False)
   else
@@ -2147,11 +2193,8 @@ var
 begin
   if Cur = nil then
     Exit;
-  if not PzAIReady(akRemove, Why) then
-  begin
-    MessageDlg('Remove', Why, mtInformation, [mbOK], 0);
+  if not PzAIReady(akRemove, Why) and not GetModel('remove', 'Remove', Why) then
     Exit;
-  end;
   if ChainHasGeometry(ParseChain(Cur.Filters)) then
   begin
     MessageDlg('Remove', 'Remove works on the uncropped, unstraightened photo: ' +
@@ -2315,9 +2358,9 @@ var
 begin
   if FUpdatingUI or (Cur = nil) or not DenoiseOf(Cur.Filters, A, K) then
     Exit;
-  if ChkDenoiseHQ.Checked and not PzAIReady(akDenoiseHQ, Why) then
+  if ChkDenoiseHQ.Checked and not PzAIReady(akDenoiseHQ, Why) and not
+    GetModel('denoise-hq', 'High quality denoise', Why) then
   begin
-    MessageDlg('AI Denoise', Why, mtInformation, [mbOK], 0);
     FUpdatingUI := True;
     ChkDenoiseHQ.Checked := False;
     FUpdatingUI := False;
@@ -2851,10 +2894,9 @@ var
   F: TForm;
   R: TRadioGroup;
   B1, B2: TButton;
-  Why: string;
 begin
   Scale := 1;
-  if not PzAIReady(akUpscale, Why) then
+  if not PzAIAvailable then
     Exit(True);
   F := TForm.CreateNew(nil);
   try
@@ -2885,6 +2927,7 @@ begin
     Result := F.ShowModal = mrOk;
     if Result then
       Scale := 1 shl R.ItemIndex;
+
   finally
     F.Free;
   end;
@@ -2895,9 +2938,13 @@ var
   T: TExportThread;
   i, Scale: Integer;
   P: TPzPhoto;
-  Suffix: string;
+  Suffix, Why: string;
 begin
   if not AskExportScale(Scale) then
+    Exit;
+  { an upscale needs its model: download it now, or stop }
+  if (Scale > 1) and not PzAIReady(akUpscale, Why) and not
+    GetModel('upscale', 'AI Upscale', Why) then
     Exit;
   Suffix := '';
   if Scale > 1 then
