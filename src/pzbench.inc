@@ -438,6 +438,34 @@ var
   OutDir: string;
   k: Integer;
 begin
+  if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'faces' then
+  begin
+    { the face indexer for a while on the real library: photos/s, faces }
+    T0 := NowSeconds;
+    StartFaceIndex;
+    if FaceIdx = nil then
+      BLog('faces: models missing')
+    else
+    begin
+      n := -1;
+      repeat
+        CheckSynchronize(0);
+        Application.ProcessMessages;
+        Sleep(100);
+        if (n < 0) and (FaceIdx.Total > 0) then
+        begin
+          n := FaceIdx.Done; // already scanned before this run
+          T0 := NowSeconds;
+        end;
+      until (NowSeconds - T0 > StrToIntDef(GetEnvironmentVariable('PZ_BENCH_SECS'), 180)) or
+        (FaceIdx.Error <> '');
+      BLog(Format('faces: %d photos scanned in %.0f s (%.1f photos/s), %d faces so far; %d / %d done%s',
+        [FaceIdx.Done - Max(0, n), NowSeconds - T0, (FaceIdx.Done - Max(0, n)) / (NowSeconds - T0),
+        FaceIdx.Faces, FaceIdx.Done, FaceIdx.Total, IfThen(FaceIdx.Error <> '', ' error ' + FaceIdx.Error, '')]));
+    end;
+    BLog('bench done');
+    Exit;
+  end;
   if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'search' then
   begin
     BenchSearch; // PZ_BENCH_ONLY=search: just index and query

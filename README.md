@@ -52,6 +52,22 @@ pixel kernels).
   one (Pentax). Otherwise it does a LibRaw half-size decode. A toggle switches
   to LibRaw rendering for all raws.
 
+* **AI tools** (local, offline, on the GPU with MNN's OpenCL backend; build
+  with `make AI=1`):
+  * **AI Denoise** (Basic Fixes): NAFNet, or SCUNet with "High quality",
+    with a strength slider. Results are cached on disk.
+  * **Remove**: click a person or a thing (MobileSAM selects it, shown in
+    red), then Remove fills it in (LaMa).
+  * **Upscale on export**: 2× or 4× with Real-ESRGAN, after the crop, so a
+    tight crop can come back at full size.
+  * **Smart search**: the toggle next to the search box finds photos by what
+    is in them ("fireworks", "rice field") using CLIP embeddings of the
+    thumbnails. The Properties panel shows what a photo "looks like".
+  * **People**: faces are found (YuNet) and grouped by who they are (SFace)
+    in the background. People and unnamed groups are listed at the top of the
+    folder tree. Naming a group writes Picasa's own `faces=` and
+    `[Contacts2]` entries, and the search box finds people by name.
+
 ## Build
 
 Requirements: FPC 3.2, a built Lazarus tree (gtk2 LCL), gcc, and the -dev
@@ -70,6 +86,24 @@ using mcx/mcxcl's options, and the Pascal sources with JCF
 
 The build produces `./pizzicato`. The C core and its benchmark tool are in
 `core/` (`core/pzbench`).
+
+### AI tools
+
+    tools/fetch_mnn.sh       # builds MNN with OpenCL into third_party/mnn
+                             # (or: ln -s <an MNN already staged> third_party/mnn)
+    tools/fetch_models.sh    # downloads + converts the models (needs `pip install MNN onnx`)
+    make AI=1
+
+The models go to `~/.local/share/pizzicato/models` (`PZ_MODELS` overrides).
+GPU auto-tuning caches go next to the thumbnail DB. `PZ_AI_GPU=1` or
+`PZ_AI_GPU=1:0` (platform:device) picks a GPU, and `PZ_AI_DEVICE=cpu` forces
+the CPU. Plain `make` builds without MNN, and the AI tools then say so.
+
+All the models have GPL-compatible licences: NAFNet (MIT), SCUNet
+(Apache-2.0), Real-ESRGAN (BSD-3), MobileSAM (Apache-2.0), LaMa (Apache-2.0),
+CLIP ViT-B/32 (MIT), YuNet (MIT) and SFace (Apache-2.0).
+`tests/ai_parity.py` and `tests/clip_parity.py` check the converted models
+against onnxruntime.
 
 ## Run
 
@@ -113,6 +147,8 @@ local disk, because SQLite WAL on NFS is slow and unsafe.
 | `sat`, `Boost`, `bw`, `sepia`, `warm`, `unsharp2` | rendered |
 | `retouch` | kept, **not rendered** (Picasa stores the retouch data elsewhere) |
 | `pzbc` (brightness/contrast), `pzvignette`, `pzsoft` | Pizzicato extensions |
+| `pzdenoise`, `pzremove` (masks in the album's `.pizzicato/`) | Pizzicato AI extensions |
+| `faces=rect64(…),<hash>`, `[Contacts2] <hash>=Name;;` | written when a person is named |
 
 The filter maths approximates Picasa's look and is not a bit-exact clone.
 Picasa's implementation is closed, and there were too few original/edited
@@ -124,6 +160,11 @@ the top of `src/pzrender.pas` and in `core/pzcore.c`.
 
     core/pzcore.c      decoders, TIFF/EXIF/MakerNote walker, resampler, filters (OpenMP)
     core/pzbench.c     command-line timing tool for the core
+    core/pzai.cpp      AI models on MNN (tiling, CLIP, faces, SAM, LaMa); C ABI in pzai.h
+    core/pzai_stub.c   the same API without MNN (plain `make`); core/pzai_cli = test tool
+    src/pzai.pas       AI bindings, the GPU worker thread, denoise/remove/upscale
+    src/pzsearch.pas   smart search: CLIP indexer + in-memory int8 index
+    src/pzfaces.pas    People: face indexer, groups, persons
     src/pzcorebind.pas Pascal bindings
     src/pzini.pas      .picasa.ini + filter chain model
     src/pzrender.pas   filter chain -> pixel ops
