@@ -69,3 +69,55 @@ int pz_ai_run_raw(pz_ai* h, const float* in, float* out) {
     (void)out;
     return -1;
 }
+
+int pz_ai_dim(const pz_ai* h) {
+    (void)h;
+    return 0;
+}
+
+int pz_ai_clip_image(pz_ai* h, const pz_image* img, float* emb) {
+    (void)h;
+    (void)img;
+    (void)emb;
+    return -1;
+}
+
+int pz_ai_clip_load_bpe(pz_ai* h, const char* vocab_json, const char* merges_txt) {
+    (void)h;
+    (void)vocab_json;
+    (void)merges_txt;
+    return -1;
+}
+
+int pz_ai_clip_tokenize(pz_ai* h, const char* text, int* ids, int max) {
+    (void)h;
+    (void)text;
+    (void)ids;
+    (void)max;
+    return -1;
+}
+
+int pz_ai_clip_text(pz_ai* h, const char* text, float* emb) {
+    (void)h;
+    (void)text;
+    (void)emb;
+    return -1;
+}
+
+int pz_ai_faces(pz_ai* det, const pz_image* img, int size, float thresh, pz_face* faces, int max) {
+    (void)det;
+    (void)img;
+    (void)size;
+    (void)thresh;
+    (void)faces;
+    (void)max;
+    return -1;
+}
+
+int pz_ai_face_embed(pz_ai* rec, const pz_image* img, const pz_face* f, float* emb) {
+    (void)rec;
+    (void)img;
+    (void)f;
+    (void)emb;
+    return -1;
+}

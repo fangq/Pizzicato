@@ -16,6 +16,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <map>
+#include <sstream>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +48,14 @@ struct pz_ai {
     bool cache_dirty = false;
     MNNDeviceContext dev{};
     MNN::BackendConfig bcfg;
+    /* embedding models */
+    bool generic = false;
+    int dim = 0;
+    std::vector<int> in_shape;
+    std::unordered_map<std::string, int> vocab;
+    std::map<std::pair<std::string, std::string>, int> ranks;
+    std::string byte2u[256];
+    std::unordered_map<std::string, std::vector<int>> bpe_cache;
 };
 
 extern "C" int pz_ai_available(void) {
@@ -171,6 +183,16 @@ static bool make_session(pz_ai* h, const char* model, int device, int tile, int 
 
     if (!h->in) {
         return false;
+    }
+
+    if (tile < 0) { /* an embedding model: the caller sizes the input */
+        h->generic = true;
+        h->out = h->net->getSessionOutput(h->sess, nullptr);
+        int fwd = cfg.type;
+        h->net->getSessionInfo(h->sess, MNN::Interpreter::BACKENDS, &fwd);
+        h->backend = fwd == MNN_FORWARD_OPENCL ? "opencl" : fwd == MNN_FORWARD_VULKAN ? "vulkan" : "cpu";
+        h->cache_dirty = gpu;
+        return h->out != nullptr;
     }
 
     std::vector<int> shp = h->in->shape();
@@ -535,4 +557,672 @@ extern "C" int pz_ai_run_tiled(pz_ai* h, const pz_image* in, pz_image* out, int 
 
     flush(base + AH);
     return 0;
+}
+
+/* ---------------- embedding models ---------------- */
+
+extern "C" int pz_ai_dim(const pz_ai* h) {
+    return h ? h->dim : 0;
+}
+
+/* size the input once (a fixed shape keeps the GPU from re-tuning) */
+static int shape_input(pz_ai* h, const std::vector<int>& shp) {
+    if (h->in_shape == shp) {
+        return 0;
+    }
+
+    h->net->resizeTensor(h->in, shp);
+    h->net->resizeSession(h->sess);
+    int status = 0;
+    h->net->getSessionInfo(h->sess, MNN::Interpreter::RESIZE_STATUS, &status);
+
+    if (status != 0) {
+        return fail("cannot allocate the model's buffers");
+    }
+
+    h->out = h->net->getSessionOutput(h->sess, nullptr);
+    h->in_shape = shp;
+    h->hin.reset(MNN::Tensor::create(shp, h->in->getType(), nullptr, MNN::Tensor::CAFFE));
+    h->hout.reset(new MNN::Tensor(h->out, MNN::Tensor::CAFFE));
+    std::vector<int> os = h->out->shape();
+    h->dim = os.empty() ? 0 : os.back();
+    return 0;
+}
+
+static int run_embed(pz_ai* h, float* emb) {
+    if (forward(h) != 0) {
+        return -1;
+    }
+
+    const float* o = h->hout->host<float>();
+    double n2 = 0;
+
+    for (int i = 0; i < h->dim; i++) {
+        n2 += (double)o[i] * o[i];
+    }
+
+    float inv = n2 > 0 ? (float)(1.0 / std::sqrt(n2)) : 0.f;
+
+    for (int i = 0; i < h->dim; i++) {
+        emb[i] = o[i] * inv;
+    }
+
+    return 0;
+}
+
+extern "C" int pz_ai_clip_image(pz_ai* h, const pz_image* img, float* emb) {
+    g_err.clear();
+
+    if (!h || !img || !img->px || img->w < 2 || img->h < 2) {
+        return fail("no image");
+    }
+
+    const int S = 224;
+
+    if (shape_input(h, {1, 3, S, S}) != 0) {
+        return -1;
+    }
+
+    /* shortest edge to 224, then the centre 224 x 224 */
+    double f = (double)S / std::min(img->w, img->h);
+    int w = std::max(S, (int)lrint(img->w * f)), hh = std::max(S, (int)lrint(img->h * f));
+    pz_image r = {0, 0, NULL};
+
+    if (pz_resize(img, w, hh, &r) != 0) {
+        return fail("out of memory");
+    }
+
+    const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+    const float stdv[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+    float* t = h->hin->host<float>();
+    const int x0 = (w - S) / 2, y0 = (hh - S) / 2;
+
+    for (int y = 0; y < S; y++) {
+        for (int x = 0; x < S; x++) {
+            uint32_t p = r.px[(size_t)(y0 + y) * w + x0 + x];
+            float c[3] = {((p >> 16) & 255) / 255.f, ((p >> 8) & 255) / 255.f, (p & 255) / 255.f};
+
+            for (int k = 0; k < 3; k++) {
+                t[(size_t)k * S * S + y * S + x] = (c[k] - mean[k]) / stdv[k];
+            }
+        }
+    }
+
+    pz_free(&r);
+    return run_embed(h, emb);
+}
+
+/* JSON string body -> UTF-8 (\uXXXX, surrogate pairs and the usual escapes) */
+static void put_utf8(std::string& o, unsigned cp) {
+    if (cp < 0x80) {
+        o += (char)cp;
+    } else if (cp < 0x800) {
+        o += (char)(0xC0 | (cp >> 6));
+        o += (char)(0x80 | (cp & 63));
+    } else if (cp < 0x10000) {
+        o += (char)(0xE0 | (cp >> 12));
+        o += (char)(0x80 | ((cp >> 6) & 63));
+        o += (char)(0x80 | (cp & 63));
+    } else {
+        o += (char)(0xF0 | (cp >> 18));
+        o += (char)(0x80 | ((cp >> 12) & 63));
+        o += (char)(0x80 | ((cp >> 6) & 63));
+        o += (char)(0x80 | (cp & 63));
+    }
+}
+
+extern "C" int pz_ai_clip_load_bpe(pz_ai* h, const char* vocab_json, const char* merges_txt) {
+    g_err.clear();
+    std::ifstream fv(vocab_json, std::ios::binary);
+
+    if (!fv) {
+        return fail(std::string("cannot read ") + vocab_json);
+    }
+
+    std::stringstream ss;
+    ss << fv.rdbuf();
+    const std::string js = ss.str();
+    size_t i = 0;
+
+    while (true) {
+        i = js.find('"', i);
+
+        if (i == std::string::npos) {
+            break;
+        }
+
+        std::string key;
+        i++;
+
+        while (i < js.size() && js[i] != '"') {
+            if (js[i] == '\\' && i + 1 < js.size()) {
+                char e = js[++i];
+
+                if (e == 'u') {
+                    unsigned cp = (unsigned)strtoul(js.substr(i + 1, 4).c_str(), nullptr, 16);
+                    i += 4;
+
+                    if (cp >= 0xD800 && cp < 0xDC00 && js.compare(i + 1, 2, "\\u") == 0) {
+                        unsigned lo = (unsigned)strtoul(js.substr(i + 3, 4).c_str(), nullptr, 16);
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+
+                    put_utf8(key, cp);
+                } else {
+                    key += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+                }
+            } else {
+                key += js[i];
+            }
+
+            i++;
+        }
+
+        size_t c = js.find(':', i);
+
+        if (c == std::string::npos) {
+            break;
+        }
+
+        h->vocab[key] = atoi(js.c_str() + c + 1);
+        i = js.find_first_of(",}", c);
+
+        if (i == std::string::npos) {
+            break;
+        }
+    }
+
+    std::ifstream fm(merges_txt);
+
+    if (!fm) {
+        return fail(std::string("cannot read ") + merges_txt);
+    }
+
+    std::string line;
+    int rank = 0;
+
+    while (std::getline(fm, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+
+        size_t sp = line.find(' ');
+
+        if (sp == std::string::npos) {
+            continue;
+        }
+
+        h->ranks[ {line.substr(0, sp), line.substr(sp + 1)}] = rank++;
+    }
+
+    /* GPT-2's byte -> printable unicode map */
+    std::vector<int> bs;
+
+    for (int b = '!'; b <= '~'; b++) {
+        bs.push_back(b);
+    }
+
+    for (int b = 0xA1; b <= 0xAC; b++) {
+        bs.push_back(b);
+    }
+
+    for (int b = 0xAE; b <= 0xFF; b++) {
+        bs.push_back(b);
+    }
+
+    std::vector<int> cs = bs;
+    int n = 0;
+
+    for (int b = 0; b < 256; b++) {
+        if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+            bs.push_back(b);
+            cs.push_back(256 + n++);
+        }
+    }
+
+    for (size_t k = 0; k < bs.size(); k++) {
+        h->byte2u[bs[k]].clear();
+        put_utf8(h->byte2u[bs[k]], (unsigned)cs[k]);
+    }
+
+    if (h->vocab.empty() || h->ranks.empty()) {
+        return fail("empty CLIP vocabulary");
+    }
+
+    return 0;
+}
+
+/* split UTF-8 into code points */
+static std::vector<std::pair<unsigned, std::string>> codepoints(const std::string& s) {
+    std::vector<std::pair<unsigned, std::string>> v;
+
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = s[i];
+        int n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+        unsigned cp = n == 1 ? c : n == 2 ? c & 31 : n == 3 ? c & 15 : c & 7;
+
+        for (int k = 1; k < n && i + k < s.size(); k++) {
+            cp = (cp << 6) | (s[i + k] & 63);
+        }
+
+        v.push_back({cp, s.substr(i, n)});
+        i += n;
+    }
+
+    return v;
+}
+
+static bool is_space(unsigned cp) {
+    return cp == ' ' || (cp >= 9 && cp <= 13) || cp == 0xA0 || cp == 0x3000 || (cp >= 0x2000 && cp <= 0x200A);
+}
+
+/* letters: ASCII letters and, approximately, every non-ASCII code point that
+ * is not a space or a common punctuation block */
+static bool is_letter(unsigned cp) {
+    if (cp < 128) {
+        return isalpha((int)cp) != 0;
+    }
+
+    return !(cp >= 0x2010 && cp <= 0x206F) && !(cp >= 0x3000 && cp <= 0x303F) && !(cp >= 0xFF00 && cp <= 0xFF0F)
+           && !(cp >= 0xA1 && cp <= 0xBF) && cp != 0xD7 && cp != 0xF7;
+}
+
+static void bpe_word(pz_ai* h, const std::string& word, std::vector<int>& out) {
+    auto it = h->bpe_cache.find(word);
+
+    if (it != h->bpe_cache.end()) {
+        out.insert(out.end(), it->second.begin(), it->second.end());
+        return;
+    }
+
+    std::vector<std::string> sym;
+
+    for (unsigned char b : word) {
+        sym.push_back(h->byte2u[b]);
+    }
+
+    if (sym.empty()) {
+        return;
+    }
+
+    sym.back() += "</w>";
+
+    while (sym.size() > 1) {
+        int best = -1, bi = -1;
+
+        for (size_t k = 0; k + 1 < sym.size(); k++) {
+            auto r = h->ranks.find({sym[k], sym[k + 1]});
+
+            if (r != h->ranks.end() && (best < 0 || r->second < best)) {
+                best = r->second;
+                bi = (int)k;
+            }
+        }
+
+        if (bi < 0) {
+            break;
+        }
+
+        /* merge every occurrence of that pair, left to right */
+        const std::string a = sym[bi], b = sym[bi + 1];
+        std::vector<std::string> ns;
+
+        for (size_t k = 0; k < sym.size(); k++) {
+            if (k + 1 < sym.size() && sym[k] == a && sym[k + 1] == b) {
+                ns.push_back(a + b);
+                k++;
+            } else {
+                ns.push_back(sym[k]);
+            }
+        }
+
+        sym.swap(ns);
+    }
+
+    std::vector<int> ids;
+
+    for (auto& t : sym) {
+        auto v = h->vocab.find(t);
+
+        if (v != h->vocab.end()) {
+            ids.push_back(v->second);
+        }
+    }
+
+    h->bpe_cache[word] = ids;
+    out.insert(out.end(), ids.begin(), ids.end());
+}
+
+extern "C" int pz_ai_clip_tokenize(pz_ai* h, const char* text, int* ids, int max) {
+    if (!h || h->vocab.empty()) {
+        return fail("no CLIP vocabulary loaded");
+    }
+
+    /* lower case, then CLIP's pre-tokenizer: contractions, letter runs,
+     * single digits, runs of other symbols */
+    std::string low;
+
+    for (const char* p = text; *p; p++) {
+        low += (char)tolower((unsigned char)*p);
+    }
+
+    auto cps = codepoints(low);
+    std::vector<int> tok = {49406};
+    size_t i = 0;
+
+    while (i < cps.size()) {
+        unsigned cp = cps[i].first;
+
+        if (is_space(cp)) {
+            i++;
+            continue;
+        }
+
+        std::string w;
+
+        if (cp == '\'' && i + 1 < cps.size()) {
+            static const char* con[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+            bool hit = false;
+
+            for (const char* c : con) {
+                size_t n = strlen(c), k;
+
+                for (k = 0; k < n && i + 1 + k < cps.size() && cps[i + 1 + k].first == (unsigned char)c[k]; k++);
+
+                if (k == n) {
+                    w = std::string("'") + c;
+                    i += 1 + n;
+                    hit = true;
+                    break;
+                }
+            }
+
+            if (hit) {
+                bpe_word(h, w, tok);
+                continue;
+            }
+        }
+
+        if (is_letter(cp)) {
+            while (i < cps.size() && is_letter(cps[i].first)) {
+                w += cps[i++].second;
+            }
+        } else if (cp < 128 && isdigit((int)cp)) {
+            w = cps[i++].second;
+        } else {
+            while (i < cps.size() && !is_space(cps[i].first) && !is_letter(cps[i].first) &&
+                    !(cps[i].first < 128 && isdigit((int)cps[i].first))) {
+                w += cps[i++].second;
+            }
+        }
+
+        bpe_word(h, w, tok);
+    }
+
+    tok.push_back(49407);
+
+    if ((int)tok.size() > max) { /* keep the end-of-text token */
+        tok.resize(max);
+        tok[max - 1] = 49407;
+    }
+
+    for (size_t k = 0; k < tok.size(); k++) {
+        ids[k] = tok[k];
+    }
+
+    return (int)tok.size();
+}
+
+extern "C" int pz_ai_clip_text(pz_ai* h, const char* text, float* emb) {
+    g_err.clear();
+    int ids[77];
+    int n = pz_ai_clip_tokenize(h, text, ids, 77);
+
+    if (n <= 0) {
+        return -1;
+    }
+
+    /* the exact length: run this tower on the CPU (MNN's OpenCL gives the
+     * same embedding for every query here), where a new length is cheap */
+    const int L = n;
+
+    if (shape_input(h, {1, L}) != 0) {
+        return -1;
+    }
+
+    halide_type_t t = h->hin->getType();
+
+    for (int k = 0; k < L; k++) {
+        int v = k < n ? ids[k] : 49407;
+
+        if (t.code == halide_type_int && t.bits == 64) {
+            h->hin->host<int64_t>()[k] = v;
+        } else if (t.code == halide_type_float) {
+            h->hin->host<float>()[k] = (float)v;
+        } else {
+            h->hin->host<int32_t>()[k] = v;
+        }
+    }
+
+    return run_embed(h, emb);
+}
+
+/* ---------------- faces ---------------- */
+
+static MNN::Tensor* named_out(pz_ai* h, const char* name, std::vector<std::unique_ptr<MNN::Tensor>>& keep) {
+    MNN::Tensor* t = h->net->getSessionOutput(h->sess, name);
+
+    if (!t) {
+        return nullptr;
+    }
+
+    keep.emplace_back(new MNN::Tensor(t, MNN::Tensor::CAFFE));
+    t->copyToHostTensor(keep.back().get());
+    return keep.back().get();
+}
+
+static float iou(const pz_face& a, const pz_face& b) {
+    float x0 = std::max(a.x, b.x), y0 = std::max(a.y, b.y);
+    float x1 = std::min(a.x + a.w, b.x + b.w), y1 = std::min(a.y + a.h, b.y + b.h);
+    float in = std::max(0.f, x1 - x0) * std::max(0.f, y1 - y0);
+    float u = a.w * a.h + b.w * b.h - in;
+    return u > 0 ? in / u : 0.f;
+}
+
+extern "C" int pz_ai_faces(pz_ai* h, const pz_image* img, int size, float thresh, pz_face* faces, int max) {
+    g_err.clear();
+
+    if (!h || !img || !img->px || img->w < 8 || img->h < 8) {
+        return fail("no image");
+    }
+
+    size = std::max(160, (size + 31) / 32 * 32);
+
+    if (shape_input(h, {1, 3, size, size}) != 0) {
+        return -1;
+    }
+
+    /* letterbox: the long edge to size, padded right and bottom */
+    double f = (double)size / std::max(img->w, img->h);
+    int w = std::max(1, (int)lrint(img->w * f)), hh = std::max(1, (int)lrint(img->h * f));
+    pz_image r = {0, 0, NULL};
+
+    if (pz_resize(img, w, hh, &r) != 0) {
+        return fail("out of memory");
+    }
+
+    float* t = h->hin->host<float>();
+    const size_t pl = (size_t)size * size;
+    std::fill(t, t + 3 * pl, 0.f);
+
+    for (int y = 0; y < hh; y++) {
+        for (int x = 0; x < w; x++) {
+            uint32_t p = r.px[(size_t)y * w + x];
+            size_t k = (size_t)y * size + x;
+            t[k] = (float)(p & 255);              /* B */
+            t[pl + k] = (float)((p >> 8) & 255);  /* G */
+            t[2 * pl + k] = (float)((p >> 16) & 255); /* R */
+        }
+    }
+
+    pz_free(&r);
+
+    if (!h->in->copyFromHostTensor(h->hin.get()) || h->net->runSession(h->sess) != MNN::NO_ERROR) {
+        return fail("MNN runSession failed");
+    }
+
+    if (h->cache_dirty) {
+        h->net->updateCacheFile(h->sess);
+        h->cache_dirty = false;
+    }
+
+    std::vector<pz_face> cand;
+    std::vector<std::unique_ptr<MNN::Tensor>> keep;
+    const int strides[3] = {8, 16, 32};
+
+    for (int si = 0; si < 3; si++) {
+        const int st = strides[si], cols = size / st, rows = size / st;
+        char n[16];
+        snprintf(n, sizeof(n), "cls_%d", st);
+        MNN::Tensor* cls = named_out(h, n, keep);
+        snprintf(n, sizeof(n), "obj_%d", st);
+        MNN::Tensor* obj = named_out(h, n, keep);
+        snprintf(n, sizeof(n), "bbox_%d", st);
+        MNN::Tensor* box = named_out(h, n, keep);
+        snprintf(n, sizeof(n), "kps_%d", st);
+        MNN::Tensor* kps = named_out(h, n, keep);
+
+        if (!cls || !obj || !box || !kps) {
+            return fail("not a YuNet model");
+        }
+
+        const float* c = cls->host<float>(), *o = obj->host<float>(), *b = box->host<float>(), *k = kps->host<float>();
+
+        for (int i = 0; i < rows * cols; i++) {
+            float sc = std::sqrt(std::min(1.f, std::max(0.f, c[i])) * std::min(1.f, std::max(0.f, o[i])));
+
+            if (sc < thresh) {
+                continue;
+            }
+
+            const int cx = i % cols, cy = i / cols;
+            pz_face fc;
+            float bw = std::exp(b[i * 4 + 2]) * st, bh = std::exp(b[i * 4 + 3]) * st;
+            float px = (cx + b[i * 4]) * st, py = (cy + b[i * 4 + 1]) * st;
+            fc.x = (float)((px - bw / 2) / f);
+            fc.y = (float)((py - bh / 2) / f);
+            fc.w = (float)(bw / f);
+            fc.h = (float)(bh / f);
+            fc.score = sc;
+
+            for (int j = 0; j < 5; j++) {
+                fc.lm[2 * j] = (float)((k[i * 10 + 2 * j] + cx) * st / f);
+                fc.lm[2 * j + 1] = (float)((k[i * 10 + 2 * j + 1] + cy) * st / f);
+            }
+
+            cand.push_back(fc);
+        }
+    }
+
+    std::sort(cand.begin(), cand.end(), [](const pz_face & a, const pz_face & b) {
+        return a.score > b.score;
+    });
+    int n = 0;
+
+    for (size_t i = 0; i < cand.size() && n < max; i++) {
+        bool dup = false;
+
+        for (int j = 0; j < n && !dup; j++) {
+            dup = iou(cand[i], faces[j]) > 0.3f;
+        }
+
+        if (!dup) {
+            faces[n++] = cand[i];
+        }
+    }
+
+    return n;
+}
+
+extern "C" int pz_ai_face_embed(pz_ai* h, const pz_image* img, const pz_face* f, float* emb) {
+    g_err.clear();
+
+    if (!h || !img || !img->px || !f) {
+        return fail("no face");
+    }
+
+    if (shape_input(h, {1, 3, 112, 112}) != 0) {
+        return -1;
+    }
+
+    /* the similarity transform taking the 5 landmarks onto ArcFace's 112 px
+     * template (least squares, Umeyama without reflection) */
+    static const float T[10] = {38.2946f, 51.6963f, 73.5318f, 51.5014f, 56.0252f, 71.7366f,
+                                41.5493f, 92.3655f, 70.7299f, 92.2041f
+                               };
+    double mx = 0, my = 0, tx = 0, ty = 0;
+
+    for (int i = 0; i < 5; i++) {
+        mx += f->lm[2 * i];
+        my += f->lm[2 * i + 1];
+        tx += T[2 * i];
+        ty += T[2 * i + 1];
+    }
+
+    mx /= 5;
+    my /= 5;
+    tx /= 5;
+    ty /= 5;
+    double sxx = 0, a = 0, b = 0;
+
+    for (int i = 0; i < 5; i++) {
+        double px = f->lm[2 * i] - mx, py = f->lm[2 * i + 1] - my;
+        double qx = T[2 * i] - tx, qy = T[2 * i + 1] - ty;
+        sxx += px * px + py * py;
+        a += px * qx + py * qy;
+        b += px * qy - py * qx;
+    }
+
+    if (sxx <= 0) {
+        return fail("degenerate landmarks");
+    }
+
+    a /= sxx;
+    b /= sxx; /* q = [a -b; b a] (p - m) + t */
+    /* inverse: p = [a b; -b a] (q - t) / (a^2 + b^2) + m */
+    const double d = a * a + b * b;
+    float* in = h->hin->host<float>();
+    const size_t pl = 112 * 112;
+
+    for (int y = 0; y < 112; y++) {
+        for (int x = 0; x < 112; x++) {
+            double qx = x - tx, qy = y - ty;
+            double sx = (a * qx + b * qy) / d + mx, sy = (-b * qx + a * qy) / d + my;
+            int x0 = (int)std::floor(sx), y0 = (int)std::floor(sy);
+            double fx = sx - x0, fy = sy - y0;
+            double acc[3] = {0, 0, 0};
+
+            for (int k = 0; k < 4; k++) {
+                int xx = x0 + (k & 1), yy = y0 + (k >> 1);
+                double w = ((k & 1) ? fx : 1 - fx) * ((k >> 1) ? fy : 1 - fy);
+                uint32_t p = 0;
+
+                if (xx >= 0 && yy >= 0 && xx < img->w && yy < img->h) {
+                    p = img->px[(size_t)yy * img->w + xx];
+                }
+
+                acc[0] += w * ((p >> 16) & 255);
+                acc[1] += w * ((p >> 8) & 255);
+                acc[2] += w * (p & 255);
+            }
+
+            /* RGB, 0..255 (OpenCV's FaceRecognizerSF: swapRB, no scaling) */
+            for (int c = 0; c < 3; c++) {
+                in[c * pl + (size_t)y * 112 + x] = (float)acc[c];
+            }
+        }
+    }
+
+    return run_embed(h, emb);
 }

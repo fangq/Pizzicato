@@ -11,7 +11,7 @@ uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
   LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
   Buttons, ImgList, gdk2,
-  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai, md5;
+  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai, pzsearch, pzfaces, md5;
 
 type
   TViewEntry = class
@@ -39,6 +39,20 @@ type
     EdSearch: TEdit;
     ChkStar: TSpeedButton;   // 'starred only' toggle
     ChkHidden: TSpeedButton; // 'show hidden photos' toggle
+    ChkSmart: TSpeedButton;  // search by description (CLIP)
+    TmrSmart: TTimer;
+    ClipIdx: TPzClipIndex;
+    ClipText: TPzClipText;
+    FDBPath: string;
+    FSmartN: Integer;
+    { People }
+    FaceIdx: TPzFaceIndex;
+    FPeople: TList;        // TPzPeopleItems shown under People in the tree
+    FPeopleNode: TTreeNode;
+    FMenuPeople: TPzPeopleItem;
+    PmPeople: TPopupMenu;
+    MiPeopleName: TMenuItem;
+    FPeopleTick: Integer;
     ImgSearch, ImgSize: TImage;
     TabIcons: TImageList;
     FEffNames: TStringList;  // filter name of each effect button, by Tag
@@ -119,6 +133,17 @@ type
     procedure DenoiseOffClick(Sender: TObject);
     procedure DenoiseHQClick(Sender: TObject);
     procedure SetDenoise(AOn: Boolean; Amount: Double; HQ: Boolean);
+    procedure SmartClick(Sender: TObject);
+    procedure TmrSmartTimer(Sender: TObject);
+    procedure SmartSearch;
+    procedure StartClipIndex;
+    procedure StartFaceIndex;
+    function PhotoMap: TList;
+    procedure RebuildPeople;
+    procedure LoadPeopleNames;
+    procedure ShowPeople(It: TPzPeopleItem);
+    procedure PeopleNameClick(Sender: TObject);
+    procedure WritePicasaFaces(const R: TPzFaceRects; const Hash, AName: string);
   private
     { state }
     FEditMode: Boolean;
@@ -301,6 +326,7 @@ type
     procedure BenchViewer(F: TPzFolder; N: Integer; Dwell: Double);
     procedure BenchEdit(P: TPzPhoto);
     procedure BenchAI(P: TPzPhoto);
+    procedure BenchSearch;
   public
     constructor Create(TheOwner: TComponent); override;
     destructor Destroy; override;
@@ -391,6 +417,7 @@ begin
     FBenchLogOpen := True;
   end;
   Lib := TPzLibrary.Create(DBPath);
+  FDBPath := DBPath;
   FAIDir := ExtractFileDir(DBPath) + '/ai';
   FAICache := TList.Create;
   pz_ai_set_cache_dir(PAnsiChar(ExtractFileDir(DBPath) + '/mnn'));
@@ -508,9 +535,24 @@ begin
   ImgSearch := AddIcon(PnlTop, 'search', 144, 10);
   EdSearch := TEdit.Create(Self);
   EdSearch.Parent := PnlTop;
-  EdSearch.SetBounds(168, 7, 220, 26);
+  EdSearch.SetBounds(168, 7, 190, 26);
   EdSearch.TextHint := 'Search folders, tags, file names';
   EdSearch.OnChange := @SearchChange;
+  ChkSmart := TSpeedButton.Create(Self);
+  ChkSmart.Parent := PnlTop;
+  ChkSmart.SetBounds(360, 6, 32, 28);
+  ChkSmart.Hint := 'Smart search: also find photos by what is in them' +
+    LineEnding + '("beach at sunset", "birthday cake", ...)';
+  ChkSmart.ShowHint := True;
+  ChkSmart.GroupIndex := 3;
+  ChkSmart.AllowAllUp := True;
+  PzSetGlyph(ChkSmart, 'smartsearch');
+  ChkSmart.Down := Settings.ReadBool('view', 'smartsearch', True);
+  ChkSmart.OnClick := @SmartClick;
+  TmrSmart := TTimer.Create(Self);
+  TmrSmart.Enabled := False;
+  TmrSmart.Interval := 350;
+  TmrSmart.OnTimer := @TmrSmartTimer;
   ChkStar := TSpeedButton.Create(Self);
   ChkStar.Parent := PnlTop;
   ChkStar.SetBounds(398, 6, 96, 28);
@@ -580,6 +622,7 @@ begin
   TreeIcons.Height := TreeIcons.Width;
   PzAddToImageList(TreeIcons, 'calendar'); // 0: a year
   PzAddToImageList(TreeIcons, 'folder');   // 1: an album
+  PzAddToImageList(TreeIcons, 'people');   // 2: People
   Tree.Images := TreeIcons;
 
   Splitter := TSplitter.Create(Self);
@@ -1000,6 +1043,13 @@ end;
 
 procedure TMainForm.LibScanDone(Sender: TObject);
 begin
+  if ChkSmart.Down then
+    StartClipIndex;
+  if ClipIdx <> nil then
+    ClipIdx.Kick;
+  StartFaceIndex;
+  if FaceIdx <> nil then
+    FaceIdx.Kick;
   RebuildTree;
   Grid.Relayout;
   if not FBench and not FGenAll then
@@ -1041,15 +1091,241 @@ begin
     Tree.EndUpdate;
     FTreeSync := False;
   end;
+  FPeopleNode := nil;
+  RebuildPeople;
+end;
+
+{ ---------------- People ---------------- }
+
+procedure TMainForm.StartFaceIndex;
+var
+  Why: string;
+begin
+  if (FaceIdx = nil) and not FGenAll and PzFacesReady(Why) then
+  begin
+    FaceIdx := TPzFaceIndex.Create(FDBPath);
+    LoadPeopleNames;
+    RebuildPeople;
+  end;
+end;
+
+{ photo id -> photo (a TList indexed by id; nil where none) }
+function TMainForm.PhotoMap: TList;
+var
+  i, k: Integer;
+  F: TPzFolder;
+  P: TPzPhoto;
+begin
+  Result := TList.Create;
+  for i := 0 to Lib.Folders.Count - 1 do
+  begin
+    F := TPzFolder(Lib.Folders[i]);
+    for k := 0 to F.Count - 1 do
+    begin
+      P := F.Photo(k);
+      if P.Id >= Result.Count then
+        Result.Count := P.Id + 1024;
+      Result[P.Id] := P;
+    end;
+  end;
+end;
+
+procedure TMainForm.LoadPeopleNames;
+var
+  Names: TStringList;
+  Map: TList;
+  i: Integer;
+  Id: Int64;
+begin
+  if FaceIdx = nil then
+    Exit;
+  Names := FaceIdx.PhotoNames;
+  Map := PhotoMap;
+  try
+    for i := 0 to Names.Count - 1 do
+    begin
+      Id := StrToInt64Def(Names.Names[i], -1);
+      if (Id >= 0) and (Id < Map.Count) and (Map[Id] <> nil) then
+        TPzPhoto(Map[Id]).People := Names.ValueFromIndex[i];
+    end;
+  finally
+    Names.Free;
+    Map.Free;
+  end;
+end;
+
+{ the People section at the top of the tree }
+procedure TMainForm.RebuildPeople;
+var
+  i: Integer;
+  It: TPzPeopleItem;
+  N: TTreeNode;
+begin
+  if FaceIdx = nil then
+    Exit;
+  FTreeSync := True;
+  Tree.BeginUpdate;
+  try
+    if FPeopleNode <> nil then
+      FPeopleNode.DeleteChildren
+    else
+    begin
+      if Tree.Items.Count > 0 then
+        FPeopleNode := Tree.Items.Insert(Tree.Items[0], 'People')
+      else
+        FPeopleNode := Tree.Items.Add(nil, 'People');
+      FPeopleNode.ImageIndex := 2;
+      FPeopleNode.SelectedIndex := 2;
+    end;
+    if FPeople <> nil then
+      for i := 0 to FPeople.Count - 1 do
+        TPzPeopleItem(FPeople[i]).Free;
+    FreeAndNil(FPeople);
+    FPeople := FaceIdx.People(3, 40);
+    for i := 0 to FPeople.Count - 1 do
+    begin
+      It := TPzPeopleItem(FPeople[i]);
+      N := Tree.Items.AddChildObject(FPeopleNode, Format('%s  (%d)',
+        [It.Name, It.Photos]), It);
+      N.ImageIndex := 2;
+      N.SelectedIndex := 2;
+    end;
+    if FaceIdx.Total > 0 then
+      FPeopleNode.Text := Format('People  (%d%% scanned)',
+        [FaceIdx.Done * 100 div Max(1, FaceIdx.Total)]);
+    FPeopleNode.Expand(False);
+  finally
+    Tree.EndUpdate;
+    FTreeSync := False;
+  end;
+end;
+
+procedure TMainForm.ShowPeople(It: TPzPeopleItem);
+var
+  Ids, Map: TList;
+  i, k, n: Integer;
+  F: TPzFolder;
+  Id: PtrInt;
+begin
+  for i := 0 to Lib.Folders.Count - 1 do
+  begin
+    F := TPzFolder(Lib.Folders[i]);
+    for k := 0 to F.Count - 1 do
+      F.Photo(k).PersonHit := False;
+  end;
+  Grid.PersonOnly := It <> nil;
+  n := 0;
+  if (It <> nil) and (FaceIdx <> nil) then
+  begin
+    Ids := FaceIdx.PhotoIds(It);
+    Map := PhotoMap;
+    try
+      for i := 0 to Ids.Count - 1 do
+      begin
+        Id := PtrInt(Ids[i]);
+        if (Id < Map.Count) and (Map[Id] <> nil) then
+        begin
+          TPzPhoto(Map[Id]).PersonHit := True;
+          Inc(n);
+        end;
+      end;
+    finally
+      Ids.Free;
+      Map.Free;
+    end;
+    LblStatus.Caption := Format('%s: %d photos', [It.Name, n]);
+  end;
+  Grid.Relayout;
+  Grid.SetScrollY(0);
+end;
+
+{ Picasa's face tags: faces=rect64(...),<hash>;... per photo and
+  [Contacts2] <hash>=Name;; in each folder's .picasa.ini }
+procedure TMainForm.WritePicasaFaces(const R: TPzFaceRects; const Hash, AName: string);
+var
+  Map: TList;
+  i: Integer;
+  P: TPzPhoto;
+  Old, FTag: string;
+begin
+  Map := PhotoMap;
+  try
+    for i := 0 to High(R) do
+    begin
+      if (R[i].Photo >= Map.Count) or (Map[R[i].Photo] = nil) then
+        Continue;
+      P := TPzPhoto(Map[R[i].Photo]);
+      P.Folder.EnsureIni;
+      FTag := 'rect64(' + PicasaRect64(R[i].X, R[i].Y, R[i].W, R[i].H) + '),' + Hash;
+      Old := P.Folder.Ini.ReadValue(P.Name, 'faces');
+      if Pos(FTag, Old) = 0 then
+      begin
+        if Old <> '' then
+          Old := Old + ';';
+        P.Folder.Ini.WriteValue(P.Name, 'faces', Old + FTag);
+      end;
+      P.Folder.Ini.WriteValue('Contacts2', Hash, AName + ';;');
+      if FDirtyFolders.IndexOf(P.Folder) < 0 then
+        FDirtyFolders.Add(P.Folder);
+    end;
+  finally
+    Map.Free;
+  end;
+  TmrIni.Enabled := False;
+  TmrIni.Enabled := True;
+end;
+
+procedure TMainForm.PeopleNameClick(Sender: TObject);
+var
+  S, Hash: string;
+  Pid: Int64;
+  R: TPzFaceRects;
+begin
+  if (FMenuPeople = nil) or (FaceIdx = nil) then
+    Exit;
+  if FMenuPeople.Kind = pkGroup then
+    S := ''
+  else
+    S := FMenuPeople.Name;
+  if not InputQuery('People', 'Name:', S) or (Trim(S) = '') then
+    Exit;
+  S := Trim(S);
+  if FMenuPeople.Kind = pkGroup then
+  begin
+    R := FaceIdx.GroupFaces(FMenuPeople.Id);
+    Pid := FaceIdx.NameGroup(FMenuPeople.Id, S, Hash);
+    if Pid > 0 then
+      WritePicasaFaces(R, Hash, S);
+  end
+  else
+  begin
+    { the contact hash stays; [Contacts2] gets the new name }
+    if FaceIdx.RenamePerson(FMenuPeople.Id, S) then
+      WritePicasaFaces(FaceIdx.PersonFaces(FMenuPeople.Id),
+        FaceIdx.PersonHash(FMenuPeople.Id), S);
+  end;
+  LoadPeopleNames;
+  RebuildPeople;
 end;
 
 procedure TMainForm.TreeChange(Sender: TObject; Node: TTreeNode);
 begin
   if FTreeSync or (Node = nil) then
     Exit;
+  { People: a person or group shows just their photos }
+  if (Node = FPeopleNode) or ((Node.Data <> nil) and
+    (TObject(Node.Data) is TPzPeopleItem)) then
+  begin
+    if Node <> FPeopleNode then
+      ShowPeople(TPzPeopleItem(Node.Data));
+    Exit;
+  end;
+  if Grid.PersonOnly then
+    ShowPeople(nil);
   if Node.Data <> nil then
     Grid.ScrollToFolder(TPzFolder(Node.Data))
-  else if Node.HasChildren and (Node.GetFirstChild <> nil) then
+  else if Node.HasChildren and (Node.GetFirstChild <> nil) and
+    (TObject(Node.GetFirstChild.Data) is TPzFolder) then
     Grid.ScrollToFolder(TPzFolder(Node.GetFirstChild.Data));
 end;
 
@@ -1099,6 +1375,106 @@ end;
 procedure TMainForm.SearchChange(Sender: TObject);
 begin
   Grid.Filter := EdSearch.Text;
+  { the CLIP part waits for a pause in the typing }
+  TmrSmart.Enabled := False;
+  if ChkSmart.Down or Grid.SmartOn then
+    TmrSmart.Enabled := True;
+end;
+
+procedure TMainForm.SmartClick(Sender: TObject);
+var
+  Why: string;
+begin
+  if ChkSmart.Down and not PzClipReady(Why) then
+  begin
+    ChkSmart.Down := False;
+    MessageDlg('Smart search', Why, mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if ChkSmart.Down then
+    StartClipIndex;
+  SmartSearch;
+end;
+
+procedure TMainForm.TmrSmartTimer(Sender: TObject);
+begin
+  TmrSmart.Enabled := False;
+  SmartSearch;
+end;
+
+procedure TMainForm.StartClipIndex;
+var
+  Why: string;
+begin
+  if (ClipIdx = nil) and not FGenAll and PzClipReady(Why) then
+    ClipIdx := TPzClipIndex.Create(FDBPath);
+end;
+
+{ search by description: CLIP's text embedding of the query against every
+  indexed photo; the best matches join the photos the text search finds }
+procedure TMainForm.SmartSearch;
+var
+  Q: array[0..CLIP_DIM - 1] of Single;
+  Hits: TPzHits;
+  ById: array of TPzPhoto;
+  i, k, n: Integer;
+  F: TPzFolder;
+  P: TPzPhoto;
+  Cut: Single;
+  T: string;
+begin
+  for i := 0 to Lib.Folders.Count - 1 do
+  begin
+    F := TPzFolder(Lib.Folders[i]);
+    for k := 0 to F.Count - 1 do
+      F.Photo(k).SmartHit := False;
+  end;
+  T := Trim(EdSearch.Text);
+  Grid.SmartOn := False;
+  if ChkSmart.Down and (T <> '') and (ClipIdx <> nil) and (ClipIdx.Indexed > 0) then
+  begin
+    if ClipText = nil then
+      ClipText := TPzClipText.Create;
+    if ClipText.Embed(T, Q) then
+    begin
+      Hits := ClipIdx.Search(Q, 1000);
+      if Length(Hits) > 0 then
+      begin
+        { CLIP's cosines are small and close together: keep the photos
+          near the best match, and only clear matches }
+        Cut := Max(0.235, Hits[0].Score - 0.045);
+        SetLength(ById, 0);
+        for i := 0 to Lib.Folders.Count - 1 do
+        begin
+          F := TPzFolder(Lib.Folders[i]);
+          for k := 0 to F.Count - 1 do
+          begin
+            P := F.Photo(k);
+            if P.Id >= Length(ById) then
+              SetLength(ById, P.Id + 1024);
+            ById[P.Id] := P;
+          end;
+        end;
+        n := 0;
+        for i := 0 to High(Hits) do
+        begin
+          if (Hits[i].Score < Cut) or (n >= 400) then
+            Break;
+          if (Hits[i].Id < Length(ById)) and (ById[Hits[i].Id] <> nil) then
+          begin
+            ById[Hits[i].Id].SmartHit := True;
+            Inc(n);
+          end;
+        end;
+        Grid.SmartOn := True;
+        FSmartN := n;
+        if FBench then
+          BLog(Format('    smart search "%s": %d photos, best %.3f, cut %.3f',
+            [T, n, Hits[0].Score, Cut]));
+      end;
+    end;
+  end;
+  Grid.Relayout;
 end;
 
 procedure TMainForm.StarChange(Sender: TObject);
@@ -2341,6 +2717,21 @@ begin
     S := 'Scanning folders… ';
   if (Lib.GenTotal > 0) and (Lib.GenDone < Lib.GenTotal) then
     S := S + Format('Building thumbnails %d / %d', [Lib.GenDone, Lib.GenTotal]);
+  if (FaceIdx <> nil) and (FaceIdx.Total > 0) and (FaceIdx.Done < FaceIdx.Total) then
+    S := S + Format('  Finding faces %d / %d', [FaceIdx.Done, FaceIdx.Total]);
+  { new groups show up under People now and then }
+  Inc(FPeopleTick);
+  if (FaceIdx <> nil) and FaceIdx.Changed and (FPeopleTick mod 30 = 0) and not
+    FEditMode then
+  begin
+    FaceIdx.Changed := False;
+    RebuildPeople;
+  end;
+  if (ClipIdx <> nil) and (ClipIdx.Total > 0) and (ClipIdx.Indexed < ClipIdx.Total) then
+    S := S + Format('  Indexing for smart search %d / %d',
+      [ClipIdx.Indexed, ClipIdx.Total]);
+  if Grid.SmartOn then
+    S := S + Format('  Smart search: %d photos', [FSmartN]);
   LblStatus.Caption := S;
   if FTreeDirty and not Lib.ScanBusy then
     RebuildTree;
@@ -2359,6 +2750,10 @@ begin
   Settings.WriteInteger('view', 'thumbsize', TrkSize.Position);
   Settings.WriteBool('view', 'rawpreview', ChkRawPreview.Checked);
   Settings.WriteBool('view', 'showhidden', ChkHidden.Down);
+  Settings.WriteBool('view', 'smartsearch', ChkSmart.Down);
+  FreeAndNil(ClipIdx);
+  FreeAndNil(ClipText);
+  FreeAndNil(FaceIdx);
   if not PnlRight.Visible then
     Settings.WriteInteger('view', 'rightpanel', 0)
   else if RightPages.ActivePage = TabTags then
@@ -2760,6 +3155,8 @@ var
   Vals: TStringList;
   Chain: TPzChain;
   E: string;
+  SceneL: TStringArray;
+  SceneP: array[0..2] of Single;
 
   { the most common value and, for several photos, how many share it }
   procedure Field(const AName: string);
@@ -2863,6 +3260,18 @@ begin
       P.Folder.EnsureIni;
       if P.MetaState <> 2 then
         Inc(Pending);
+    end;
+    { what CLIP sees in it, for a single photo }
+    if (N = 1) and (ClipIdx <> nil) and ClipIdx.LabelsReady then
+    begin
+      SceneL := ClipIdx.SceneLabels(TPzPhoto(L[0]).Id, 3, SceneP);
+      E := '';
+      for i := 0 to High(SceneL) do
+        if (i = 0) or (SceneP[i] >= 0.08) then
+          E := E + IfThen(E <> '', ', ', '') + Format('%s (%.0f%%)',
+            [SceneL[i], SceneP[i] * 100]);
+      if E <> '' then
+        LstProps.Items.Add('Looks like' + #9 + E);
     end;
     for i := 0 to NTop - 1 do Add(TPzPhoto(L[i]).Folder.Path);
     Field('Location');
@@ -3619,6 +4028,8 @@ begin
   AddMI(PmView, 'Properties', 'info', '', @MPropsClick);
 
   { an album: in the folder list or a folder header in the grid }
+  PmPeople := TPopupMenu.Create(Self);
+  MiPeopleName := AddMI(PmPeople, 'Name This Person…', 'tag', '', @PeopleNameClick);
   PmFolder := TPopupMenu.Create(Self);
   MiFSelect := AddMI(PmFolder, 'Select All Photos', 'library', '', @MFSelectClick);
   MiFHold := AddMI(PmFolder, 'Hold All in Tray', 'pin', '', @MFHoldClick);
@@ -3719,7 +4130,17 @@ var
 begin
   Handled := True;
   N := Tree.GetNodeAt(MousePos.X, MousePos.Y);
-  if N <> nil then
+  if (N <> nil) and (N.Data <> nil) and (TObject(N.Data) is TPzPeopleItem) then
+  begin
+    FMenuPeople := TPzPeopleItem(N.Data);
+    if FMenuPeople.Kind = pkGroup then
+      MiPeopleName.Caption := 'Name This Person…'
+    else
+      MiPeopleName.Caption := 'Rename…';
+    PmPeople.PopUp;
+    Exit;
+  end;
+  if (N <> nil) and (N.Data <> nil) and (TObject(N.Data) is TPzFolder) then
     FMenuFolder := TPzFolder(N.Data)
   else
     FMenuFolder := nil;

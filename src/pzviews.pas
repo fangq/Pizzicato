@@ -43,6 +43,8 @@ type
     FFolderIcon: TBitmap;
     FStarOnly: Boolean;
     FShowHidden: Boolean;
+    FSmartOn: Boolean;
+    FPersonOnly: Boolean;
     FFilter: string;
     FOnOpen: TPzPhotoEvent;
     FOnSelect: TPzPhotoEvent;
@@ -95,6 +97,10 @@ type
     property Selected: TPzPhoto read FSelected;
     property StarOnly: Boolean read FStarOnly write SetStarOnly;
     property ShowHidden: Boolean read FShowHidden write SetShowHidden;
+    { photos with SmartHit count as matches of the search too }
+    property SmartOn: Boolean read FSmartOn write FSmartOn;
+    { only the photos with PersonHit (a person picked in People) }
+    property PersonOnly: Boolean read FPersonOnly write FPersonOnly;
     property Filter: string read FFilter write SetFilter;
     property OnOpen: TPzPhotoEvent read FOnOpen write FOnOpen;
     property OnSelect: TPzPhotoEvent read FOnSelect write FOnSelect;
@@ -409,7 +415,8 @@ end;
 function TPzGrid.IsShown(P: TPzPhoto): Boolean;
 begin
   Result := (P <> nil) and (not FStarOnly or P.Star) and
-    (FShowHidden or not P.Hidden) and ((FFilter = '') or P.FilterHit or
+    (not FPersonOnly or P.PersonHit) and (FShowHidden or not P.Hidden) and
+    ((FFilter = '') or P.FilterHit or (FSmartOn and P.SmartHit) or
     ((P.Folder <> nil) and P.Folder.FilterAll));
 end;
 
@@ -440,11 +447,11 @@ begin
       for k := 0 to F.Count - 1 do
         F.Photo(k).FilterHit :=
           Pos(Low, LowerCase(F.Photo(k).Name + ' ' + F.Photo(k).Keywords +
-          ' ' + F.Photo(k).Caption)) > 0;
+          ' ' + F.Photo(k).Caption + ' ' + F.Photo(k).People)) > 0;
     end;
     if FStarOnly then
       F.EnsureIni;
-    if FStarOnly or not F.FilterAll or not FShowHidden then
+    if FStarOnly or FPersonOnly or not F.FilterAll or not FShowHidden then
     begin
       n := 0;
       for k := 0 to F.Count - 1 do

@@ -58,6 +58,31 @@ int  pz_ai_run_tiled(pz_ai* h, const pz_image* in, pz_image* out, int overlap,
  * out (3 x tile*scale x tile*scale), for parity tests against onnxruntime. */
 int  pz_ai_run_raw(pz_ai* h, const float* in, float* out);
 
+/* ---- embedding models (CLIP) ----
+ * pz_ai_open with tile < 0 opens a model without the image-to-image
+ * set-up; these calls then size its input themselves. Embeddings are
+ * L2-normalised; dim = pz_ai_dim(h) floats. */
+int  pz_ai_dim(const pz_ai* h);
+/* CLIP image tower: shortest edge to 224, centre crop, CLIP's mean/std */
+int  pz_ai_clip_image(pz_ai* h, const pz_image* img, float* emb);
+/* CLIP text tower: load the byte-level BPE (vocab.json, merges.txt) once */
+int  pz_ai_clip_load_bpe(pz_ai* h, const char* vocab_json, const char* merges_txt);
+int  pz_ai_clip_tokenize(pz_ai* h, const char* text, int* ids, int max);
+int  pz_ai_clip_text(pz_ai* h, const char* text, float* emb);
+
+/* ---- faces: YuNet detection, SFace recognition (OpenCV zoo models) ---- */
+typedef struct {
+    float x, y, w, h;   /* box in image pixels */
+    float score;
+    float lm[10];       /* eyes, nose tip, mouth corners (x, y) */
+} pz_face;
+
+/* faces in img, best first, at most max; size: the detector's input edge
+ * (a multiple of 32; larger finds smaller faces). Returns the count. */
+int  pz_ai_faces(pz_ai* det, const pz_image* img, int size, float thresh, pz_face* faces, int max);
+/* a face's 128-d identity embedding (L2-normalised; same person: cos > ~0.36) */
+int  pz_ai_face_embed(pz_ai* rec, const pz_image* img, const pz_face* f, float* emb);
+
 #ifdef __cplusplus
 }
 #endif

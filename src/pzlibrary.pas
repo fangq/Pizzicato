@@ -61,6 +61,9 @@ type
     Selected: Boolean;   // in the grid's selection
     Held: Boolean;       // pinned in the photo tray
     FilterHit: Boolean;  // matches the search text
+    SmartHit: Boolean;   // matches the search by description (CLIP)
+    PersonHit: Boolean;  // shows the person picked in People
+    People: string;      // names of the people in it, for the search box
     { tags: Picasa's comma-separated keywords= }
     Keywords: string;
     Caption: string;     // Picasa's caption=
@@ -841,6 +844,8 @@ begin
     + 'mtime INTEGER, w INTEGER, h INTEGER, taken INTEGER, fmt INTEGER, camera TEXT, '
     + 'hidden INTEGER DEFAULT 0, UNIQUE(folder,name))');
   Exec('CREATE TABLE IF NOT EXISTS thumbs(id INTEGER PRIMARY KEY, data BLOB)');
+  { CLIP embeddings of the thumbnails, for search by description (pzsearch) }
+  Exec('CREATE TABLE IF NOT EXISTS clip(id INTEGER PRIMARY KEY, emb BLOB)');
   { databases from before 'hidden': add it, and re-list every folder once so
     the scanner picks the flags up from the .picasa.ini files }
   if sqlite3_exec(FDB, 'ALTER TABLE photos ADD COLUMN hidden INTEGER DEFAULT 0',
@@ -915,6 +920,7 @@ begin
   try
     Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
     Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
+    Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
   finally
     FDBLock.Leave;
   end;
@@ -1380,6 +1386,7 @@ begin
             sqlite3_step(St);
             sqlite3_finalize(St);
             Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
+            Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
           end;
         end
         else
@@ -1414,6 +1421,7 @@ begin
         P := TPzPhoto(Old.Objects[i]);
         Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
         Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
+        Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
         P.Folder := F;
         P.Removed := True;
         FGraveyard.Add(P);

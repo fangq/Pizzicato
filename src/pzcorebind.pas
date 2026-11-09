@@ -84,6 +84,8 @@ procedure pz_set_threads(n: cint); cdecl; external;
 function pz_version: PAnsiChar; cdecl; external;
 
 { Helpers }
+procedure pz_dot_i8(m: PShortInt; scale: PSingle; n, d: cint; q: PSingle; out_: PSingle);
+  cdecl; external;
 procedure PzInit(out img: Tpz_image);
 function PzMake(const m: Tpz_meta): string;
 

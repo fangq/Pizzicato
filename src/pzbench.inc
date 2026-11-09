@@ -356,6 +356,75 @@ begin
   SetEditMode(False);
 end;
 
+{ index every thumbnail for the smart search, then a few queries }
+procedure TMainForm.BenchSearch;
+const
+  Queries: array[0..9] of string = ('fireworks', 'sunset over the ocean', 'rice field',
+    'statue', 'birthday cake', 'snow', 'a dog', 'temple', 'people at the beach', 'flowers');
+var
+  T0, T1, TLast: Double;
+  Why: string;
+  i, k, n0, m: Integer;
+  F: TPzFolder;
+  TopS: string;
+begin
+  if not PzClipReady(Why) then
+  begin
+    BLog('smart search: ' + Why);
+    Exit;
+  end;
+  BLog('smart search (CLIP ViT-B/32):');
+  T0 := NowSeconds;
+  StartClipIndex;
+  repeat
+    CheckSynchronize(0);
+    Application.ProcessMessages;
+    Sleep(20);
+  until ClipIdx.LabelsReady or (ClipIdx.Error <> '') or (NowSeconds - T0 > 120);
+  BLog(Format('  %d scene labels embedded in %.0f ms', [PzSceneLabelCount, (NowSeconds - T0) * 1000]));
+  n0 := ClipIdx.Indexed;
+  T1 := NowSeconds;
+  TLast := T1;
+  repeat
+    CheckSynchronize(0);
+    Application.ProcessMessages;
+    Sleep(50);
+    if NowSeconds - TLast > 60 then
+    begin
+      TLast := NowSeconds;
+      BLog(Format('  indexed %d / %d  (%.1f photos/s)', [ClipIdx.Indexed, ClipIdx.Total,
+        (ClipIdx.Indexed - n0) / (NowSeconds - T1)]));
+    end;
+  until ((ClipIdx.Total > 0) and (ClipIdx.Indexed >= ClipIdx.Total)) or
+    (ClipIdx.Error <> '') or (NowSeconds - T1 > 7200);
+  BLog(Format('  indexed %d / %d in %.1f s (%.1f photos/s)%s', [ClipIdx.Indexed, ClipIdx.Total,
+    NowSeconds - T1, (ClipIdx.Indexed - n0) / Max(0.001, NowSeconds - T1),
+    IfThen(ClipIdx.Error <> '', ' error: ' + ClipIdx.Error, '')]));
+  ChkSmart.Down := True;
+  for i := 0 to High(Queries) do
+  begin
+    EdSearch.Text := Queries[i];
+    T0 := NowSeconds;
+    SmartSearch;
+    T0 := (NowSeconds - T0) * 1000;
+    TopS := '';
+    m := 0;
+    for k := 0 to Lib.Folders.Count - 1 do
+    begin
+      F := TPzFolder(Lib.Folders[k]);
+      for n0 := 0 to F.Count - 1 do
+        if F.Photo(n0).SmartHit and (m < 4) then
+        begin
+          TopS := TopS + ' ' + F.Name + '/' + F.Photo(n0).Name;
+          Inc(m);
+        end;
+    end;
+    BLog(Format('    %.0f ms; first hits in grid order:%s', [T0, TopS]));
+  end;
+  EdSearch.Text := '';
+  SmartSearch;
+end;
+
 procedure TMainForm.RunBench;
 var
   E, T0, Pos0: Double;
@@ -369,6 +438,12 @@ var
   OutDir: string;
   k: Integer;
 begin
+  if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'search' then
+  begin
+    BenchSearch; // PZ_BENCH_ONLY=search: just index and query
+    BLog('bench done');
+    Exit;
+  end;
   BLog(Format('window shown; roots=%s; workers=%d; grid %dx%d thumb %d',
     [Lib.Roots.CommaText, PzCPUCount, Grid.ClientWidth, Grid.ClientHeight, Grid.ThumbSize]));
   n := 0;
@@ -508,6 +583,7 @@ begin
     F := FindFolder(Lib, '', 4, 0);
   if F <> nil then
     BenchEdit(F.Photo(3));
+  BenchSearch;
   { 8. full-resolution export (decode + chain + JPEG q92) }
   OutDir := GetEnvironmentVariable('PZ_BENCH_OUT');
   if OutDir <> '' then

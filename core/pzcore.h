@@ -91,6 +91,10 @@ void pz_vignette(pz_image* img, float amount);
 int  pz_crop(pz_image* img, float l, float t, float r, float b);
 int  pz_tilt(pz_image* img, float degrees);
 
+/* scores of n int8 vectors of d values (row i scaled by scale[i]) against
+ * the float query q: out[i] = scale[i] * dot(m[i], q). For embedding search. */
+void pz_dot_i8(const int8_t* m, const float* scale, int n, int d, const float* q, float* out);
+
 /* number of worker threads used by the kernels */
 void pz_set_threads(int n);
 const char* pz_version(void);

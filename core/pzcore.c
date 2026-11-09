@@ -2665,3 +2665,20 @@ int pz_tilt(pz_image* img, float deg) {
     *img = d;
     return 0;
 }
+
+void pz_dot_i8(const int8_t* m, const float* scale, int n, int d, const float* q, float* out) {
+    int i;
+    #pragma omp parallel for schedule(static) if (n > 20000)
+
+    for (i = 0; i < n; i++) {
+        const int8_t* r = m + (size_t)i * d;
+        float acc = 0.f;
+        int k;
+
+        for (k = 0; k < d; k++) {
+            acc += r[k] * q[k];
+        }
+
+        out[i] = acc * scale[i];
+    }
+}

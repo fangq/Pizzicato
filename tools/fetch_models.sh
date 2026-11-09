@@ -70,7 +70,30 @@ model_mobilesam() { # subject selection (Apache-2.0 MobileSAM; ONNX export by Ac
     convert "$SRC/mobilesam/sam_mask_decoder_single.onnx" mobilesam_dec.mnn
 }
 
-ALL=(nafnet scunet esrgan mobilesam)
+model_clip() { # search by description (MIT, OpenAI CLIP ViT-B/32; ONNX export by Xenova)
+    local u=$HF/Xenova/clip-vit-base-patch32/resolve/main
+    fetch "$u/onnx/vision_model.onnx" "$SRC/clip/vision_model.onnx" \
+        fd6e1402a588279d1723c7534d4bcba5bc0b14b47dfab0e46f8c47b8270d7d40
+    fetch "$u/onnx/text_model.onnx" "$SRC/clip/text_model.onnx" \
+        3f6571f5bad13a97c469c1622e1cfc4d9aef78b79fdbfcff804ca357bfada8cc
+    fetch "$u/vocab.json" "$SRC/clip/vocab.json" 5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363
+    fetch "$u/merges.txt" "$SRC/clip/merges.txt" 9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a
+    convert "$SRC/clip/vision_model.onnx" clip_vision.mnn
+    convert "$SRC/clip/text_model.onnx" clip_text.mnn
+    cp "$SRC/clip/vocab.json" "$PZ_MODELS/clip_vocab.json"
+    cp "$SRC/clip/merges.txt" "$PZ_MODELS/clip_merges.txt"
+}
+
+model_faces() { # People: YuNet detection (MIT) and SFace recognition (Apache-2.0), OpenCV zoo
+    fetch "$HF/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx" \
+        "$SRC/face/yunet.onnx" 8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+    fetch "$HF/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx" \
+        "$SRC/face/sface.onnx" 0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79
+    convert "$SRC/face/yunet.onnx" face_yunet.mnn
+    convert "$SRC/face/sface.onnx" face_sface.mnn
+}
+
+ALL=(nafnet scunet esrgan mobilesam clip faces)
 for m in "${@:-${ALL[@]}}"; do
     "model_$m"
 done
