@@ -34,6 +34,28 @@ function pz_ai_run_tiled(h: Ppz_ai; img, out_: Ppz_image;
   cdecl; external;
 
 type
+  TPzBoolArray = array of Boolean;
+
+  { the photos a background indexer in manual mode was asked to do
+    (--autoface off, --autoscene off); thread-safe }
+  TPzWorkList = class
+  private
+    FLock: TCriticalSection;
+    FIds: array of Int64;
+    FN: Integer;
+    FAll, FCancel: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Add(Id: Int64);
+    procedure AddAll;
+    procedure Cancel;      // drop the requests and stop the run in progress
+    { the requests so far, cleared; Want[id] marks a requested photo, All =
+      every photo; False when there are none }
+    function Take(out Want: TPzBoolArray; out All: Boolean): Boolean;
+    function Cancelled: Boolean;
+  end;
+
   TPzAIKind = (akDenoise, akDenoiseHQ, akUpscale, akRemove);
 
   TPzAIProgressEvent = procedure(Done, Total: Integer) of object;
@@ -162,6 +184,83 @@ const
   { overlap between tiles, in input pixels }
   MODEL_OVERLAP: array[TPzAIKind] of Integer = (32, 32, 8, 0);
   MODEL_TILE: array[TPzAIKind] of Integer = (0, 256, 0, -1);
+
+{ TPzWorkList }
+
+constructor TPzWorkList.Create;
+begin
+  FLock := TCriticalSection.Create;
+end;
+
+destructor TPzWorkList.Destroy;
+begin
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TPzWorkList.Add(Id: Int64);
+begin
+  FLock.Enter;
+  try
+    if FN >= Length(FIds) then
+      SetLength(FIds, Max(256, FN * 2));
+    FIds[FN] := Id;
+    Inc(FN);
+    FCancel := False;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TPzWorkList.AddAll;
+begin
+  FLock.Enter;
+  FAll := True;
+  FCancel := False;
+  FLock.Leave;
+end;
+
+procedure TPzWorkList.Cancel;
+begin
+  FLock.Enter;
+  FN := 0;
+  FAll := False;
+  FCancel := True;
+  FLock.Leave;
+end;
+
+function TPzWorkList.Cancelled: Boolean;
+begin
+  Result := FCancel;
+end;
+
+function TPzWorkList.Take(out Want: TPzBoolArray; out All: Boolean): Boolean;
+var
+  i: Integer;
+  M: Int64;
+begin
+  Want := nil;
+  FLock.Enter;
+  try
+    All := FAll;
+    Result := FAll or (FN > 0);
+    if not FAll and (FN > 0) then
+    begin
+      M := 0;
+      for i := 0 to FN - 1 do
+        M := Max(M, FIds[i]);
+      SetLength(Want, M + 1);
+      for i := 0 to FN - 1 do
+        if FIds[i] >= 0 then
+          Want[FIds[i]] := True;
+    end;
+    FN := 0;
+    FAll := False;
+    FCancel := False;
+  finally
+    FLock.Leave;
+  end;
+end;
 
 threadvar
   THandles: array[TPzAIKind] of Ppz_ai;

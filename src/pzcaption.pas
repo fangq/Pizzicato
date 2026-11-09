@@ -26,14 +26,21 @@ type
     FBackend: string;
     FSeconds: Double;          // time spent captioning this run
     FMade: Integer;            // captions made this run
+    FAuto: Boolean;            // describe every new photo; else only on request
+    FWork: TPzWorkList;
+    FJobDone, FJobTotal: Integer;
     procedure Put(Id: Int64; const S: string);
   protected
     procedure Execute; override;
   public
-    constructor Create(const ADBPath: string);
+    constructor Create(const ADBPath: string; AAuto: Boolean = True);
     destructor Destroy; override;
     procedure Stop;
     procedure Kick;            // look for new thumbnails now
+    { manual mode: describe these photos (those without a caption yet) }
+    procedure Request(Id: Int64);
+    procedure RequestAll;
+    procedure Cancel;
     function Caption(Id: Int64): string;
     { all captions, by photo id ('-' = the captioner had nothing to say) }
     function Snapshot: TStringArray;
@@ -44,6 +51,10 @@ type
     property Backend: string read FBackend;
     property Made: Integer read FMade;
     property Seconds: Double read FSeconds;
+    property Auto: Boolean read FAuto;
+    { the photos of the run in progress (manual mode) }
+    property JobDone: Integer read FJobDone;
+    property JobTotal: Integer read FJobTotal;
   end;
 
 { the captioner is installed (and AI is built in); Why says what is missing }
@@ -84,9 +95,11 @@ end;
 
 { TPzCaptionIndex }
 
-constructor TPzCaptionIndex.Create(const ADBPath: string);
+constructor TPzCaptionIndex.Create(const ADBPath: string; AAuto: Boolean);
 begin
   FDBPath := ADBPath;
+  FAuto := AAuto;
+  FWork := TPzWorkList.Create;
   FLock := TCriticalSection.Create;
   FWake := TEvent.Create(nil, False, False, '');
   FreeOnTerminate := False;
@@ -99,6 +112,7 @@ begin
   Stop;
   FWake.Free;
   FLock.Free;
+  FWork.Free;
   inherited Destroy;
 end;
 
@@ -114,6 +128,23 @@ end;
 procedure TPzCaptionIndex.Kick;
 begin
   FWake.SetEvent;
+end;
+
+procedure TPzCaptionIndex.Request(Id: Int64);
+begin
+  FWork.Add(Id);
+  FWake.SetEvent;
+end;
+
+procedure TPzCaptionIndex.RequestAll;
+begin
+  FWork.AddAll;
+  FWake.SetEvent;
+end;
+
+procedure TPzCaptionIndex.Cancel;
+begin
+  FWork.Cancel;
 end;
 
 procedure TPzCaptionIndex.Put(Id: Int64; const S: string);
@@ -165,16 +196,27 @@ var
   St, Ins, Get: psqlite3_stmt;
   H: Ppz_ai;
   Todo: array of Int64;
-  i, n, k: Integer;
+  i, n, k, k2, nb: Integer;
+  BId: array[0..15] of Int64;
+  BText: array[0..15] of string;
   Id: Int64;
   Img: Tpz_image;
   Txt: array[0..511] of AnsiChar;
   S: string;
   T0: Double;
-  Have: Boolean;
+  Have, All: Boolean;
+  Want: TPzBoolArray;
+
+  function Stopped: Boolean;
+  begin
+    Result := Terminated or (not FAuto and FWork.Cancelled);
+  end;
+
 begin
   H := nil;
   DB := nil;
+  Ins := nil;
+  Get := nil;
   if sqlite3_open_v2(PAnsiChar(FDBPath), @DB, SQLITE_OPEN_READWRITE, nil) <>
     SQLITE_OK then
   begin
@@ -197,18 +239,31 @@ begin
     FAdded := FCount;
     if Terminated then
       Exit;
-    if pz_ai_caption_open(PAnsiChar(PzCaptionModelDir), PZ_AI_OPENCL, @H) <> 0 then
-    begin
-      FError := StrPas(pz_ai_error);
-      Exit;
-    end;
-    FBackend := StrPas(pz_ai_backend(H));
     sqlite3_prepare_v2(DB, 'INSERT OR REPLACE INTO captions(id, text) VALUES(?, ?)',
       -1, @Ins, nil);
     sqlite3_prepare_v2(DB, 'SELECT data FROM thumbs WHERE id=?', -1, @Get, nil);
     while not Terminated do
     begin
-      { the thumbnails without a caption }
+      { manual mode: nothing to do until asked }
+      All := True;
+      Want := nil;
+      if not FAuto and not FWork.Take(Want, All) then
+      begin
+        FWake.WaitFor(INFINITE);
+        Continue;
+      end;
+      { the model goes on the GPU only once there is work }
+      if H = nil then
+      begin
+        if pz_ai_caption_open(PAnsiChar(PzCaptionModelDir), PZ_AI_OPENCL, @H) <> 0 then
+        begin
+          FError := StrPas(pz_ai_error);
+          H := nil;
+          Break;
+        end;
+        FBackend := StrPas(pz_ai_backend(H));
+      end;
+      { the thumbnails without a caption (of those asked for) }
       Todo := nil;
       n := 0;
       FTotal := 0;
@@ -221,7 +276,7 @@ begin
           FLock.Enter;
           Have := (Id < Length(FText)) and (FText[Id] <> '');
           FLock.Leave;
-          if not Have then
+          if not Have and (All or ((Id < Length(Want)) and Want[Id])) then
           begin
             if n >= Length(Todo) then
               SetLength(Todo, Max(256, n * 2));
@@ -231,25 +286,36 @@ begin
         end;
         sqlite3_finalize(St);
       end;
-      { newest photos (highest ids) first; a few at a time per transaction,
-        so other connections are not kept waiting }
+      { newest photos (highest ids) first, 16 at a time. The captioning
+        runs outside any transaction; each batch is then written in one
+        short write transaction. (A deferred transaction that reads first
+        cannot write once another connection has committed meanwhile:
+        SQLITE_BUSY_SNAPSHOT, which no busy timeout cures.) }
+      FJobTotal := n;
+      FJobDone := 0;
       k := n - 1;
-      while (k >= 0) and not Terminated do
+      while (k >= 0) and not Stopped do
       begin
-        sqlite3_exec(DB, 'BEGIN', nil, nil, nil);
+        nb := 0;
         for i := 0 to 15 do
         begin
-          if (k < 0) or Terminated then
+          if (k < 0) or Stopped then
             Break;
+          Inc(FJobDone);
           Id := Todo[k];
           Dec(k);
           sqlite3_reset(Get);
           sqlite3_bind_int64(Get, 1, Id);
           if sqlite3_step(Get) <> SQLITE_ROW then
+          begin
+            sqlite3_reset(Get);
             Continue;
+          end;
           PzInit(Img);
-          if pz_decode_jpeg_mem(sqlite3_column_blob(Get, 0),
-            sqlite3_column_bytes(Get, 0), 0, 0, 0, @Img) <> 0 then
+          k2 := pz_decode_jpeg_mem(sqlite3_column_blob(Get, 0),
+            sqlite3_column_bytes(Get, 0), 0, 0, 0, @Img);
+          sqlite3_reset(Get); // do not keep a read open
+          if k2 <> 0 then
             Continue;
           T0 := NowSec;
           Txt[0] := #0;
@@ -261,24 +327,36 @@ begin
             if S = '' then
               S := '-'; // nothing to say; do not ask again
             Put(Id, S);
-            sqlite3_reset(Ins);
-            sqlite3_bind_int64(Ins, 1, Id);
-            sqlite3_bind_text(Ins, 2, PAnsiChar(S), -1, nil);
-            sqlite3_step(Ins);
-            Inc(FAdded);
+            BId[nb] := Id;
+            BText[nb] := S;
+            Inc(nb);
           end
           else if FError = '' then
             FError := StrPas(pz_ai_error);
           pz_free(@Img);
         end;
-        sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
+        if nb > 0 then
+        begin
+          sqlite3_exec(DB, 'BEGIN IMMEDIATE', nil, nil, nil);
+          for i := 0 to nb - 1 do
+          begin
+            sqlite3_reset(Ins);
+            sqlite3_bind_int64(Ins, 1, BId[i]);
+            sqlite3_bind_text(Ins, 2, PAnsiChar(BText[i]), -1, nil);
+            sqlite3_step(Ins);
+          end;
+          sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
+          Inc(FAdded, nb);
+        end;
       end;
-      if not Terminated then
+      FJobTotal := 0;
+      FJobDone := 0;
+      if FAuto and not Terminated then
         FWake.WaitFor(30000); // new thumbnails show up as they are made
     end;
+  finally
     sqlite3_finalize(Ins);
     sqlite3_finalize(Get);
-  finally
     if H <> nil then
       pz_ai_close(H);
     sqlite3_close(DB);

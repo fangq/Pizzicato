@@ -51,13 +51,20 @@ type
     FDone, FTotal, FFaces: Integer;
     FError: string;
     FChanged: Boolean;
+    FAuto: Boolean;          // scan every new photo; else only on request
+    FWork: TPzWorkList;
+    FJobDone, FJobTotal: Integer;
   protected
     procedure Execute; override;
   public
-    constructor Create(const ADBPath: string);
+    constructor Create(const ADBPath: string; AAuto: Boolean = True);
     destructor Destroy; override;
     procedure Stop;
     procedure Kick;
+    { manual mode: find the faces in these photos (those not scanned yet) }
+    procedure Request(Id: Int64);
+    procedure RequestAll;
+    procedure Cancel;
     { main thread: people (named) first, then unnamed groups of at least
       MinGroup photos, biggest first }
     function People(MinGroup, MaxGroups: Integer): TList;
@@ -75,6 +82,10 @@ type
     property Faces: Integer read FFaces;
     property Error: string read FError;
     property Changed: Boolean read FChanged write FChanged;
+    property Auto: Boolean read FAuto;
+    { the photos of the run in progress (manual mode) }
+    property JobDone: Integer read FJobDone;
+    property JobTotal: Integer read FJobTotal;
   end;
 
 function PzFacesReady(out Why: string): Boolean;
@@ -146,9 +157,11 @@ end;
 
 { TPzFaceIndex }
 
-constructor TPzFaceIndex.Create(const ADBPath: string);
+constructor TPzFaceIndex.Create(const ADBPath: string; AAuto: Boolean);
 begin
   FDBPath := ADBPath;
+  FAuto := AAuto;
+  FWork := TPzWorkList.Create;
   FWake := TEvent.Create(nil, False, False, '');
   if sqlite3_open_v2(PAnsiChar(ADBPath), @FMain, SQLITE_OPEN_READWRITE, nil) =
     SQLITE_OK then
@@ -167,6 +180,7 @@ begin
   if FMain <> nil then
     sqlite3_close(FMain);
   FWake.Free;
+  FWork.Free;
   inherited Destroy;
 end;
 
@@ -182,6 +196,23 @@ end;
 procedure TPzFaceIndex.Kick;
 begin
   FWake.SetEvent;
+end;
+
+procedure TPzFaceIndex.Request(Id: Int64);
+begin
+  FWork.Add(Id);
+  FWake.SetEvent;
+end;
+
+procedure TPzFaceIndex.RequestAll;
+begin
+  FWork.AddAll;
+  FWake.SetEvent;
+end;
+
+procedure TPzFaceIndex.Cancel;
+begin
+  FWork.Cancel;
 end;
 
 function TPzFaceIndex.People(MinGroup, MaxGroups: Integer): TList;
@@ -401,6 +432,15 @@ var
   i, j, k, n, nf, g, best, Batch: Integer;
   c, bc, nrm: Double;
   P: PByte;
+  Want: TPzBoolArray;
+  All: Boolean;
+  Id: Int64;
+
+  function Stopped: Boolean;
+  begin
+    Result := Terminated or (not FAuto and FWork.Cancelled);
+  end;
+
 begin
   DB := nil;
   Det := nil;
@@ -415,13 +455,6 @@ begin
     end;
     sqlite3_busy_timeout(DB, 10000);
     MakeTables(DB);
-    if (pz_ai_open(PAnsiChar(FaceFile('face_yunet.mnn')), PZ_AI_OPENCL, -1, 0, @Det) <>
-      0) or (pz_ai_open(PAnsiChar(FaceFile('face_sface.mnn')),
-      PZ_AI_OPENCL, -1, 0, @Rec) <> 0) then
-    begin
-      FError := StrPas(pz_ai_error);
-      Exit;
-    end;
     { the groups so far, from their faces }
     if sqlite3_prepare_v2(DB,
       'SELECT grp, emb FROM faces WHERE grp > 0 AND emb IS NOT NULL', -1, @St, nil) =
@@ -453,7 +486,25 @@ begin
       -1, @Scan, nil);
     while not Terminated do
     begin
-      { the photos not scanned yet, newest first }
+      { manual mode: nothing to do until asked }
+      All := True;
+      Want := nil;
+      if not FAuto and not FWork.Take(Want, All) then
+      begin
+        FWake.WaitFor(INFINITE);
+        Continue;
+      end;
+      { the models go on the GPU only once there is work }
+      if Det = nil then
+        if (pz_ai_open(PAnsiChar(FaceFile('face_yunet.mnn')), PZ_AI_OPENCL,
+          -1, 0, @Det) <> 0) or
+          (pz_ai_open(PAnsiChar(FaceFile('face_sface.mnn')), PZ_AI_OPENCL, -1,
+          0, @Rec) <> 0) then
+        begin
+          FError := StrPas(pz_ai_error);
+          Break;
+        end;
+      { the photos not scanned yet (of those asked for), newest first }
       Ids := nil;
       Paths.Clear;
       n := 0;
@@ -463,9 +514,12 @@ begin
       begin
         while sqlite3_step(St) = SQLITE_ROW do
         begin
+          Id := sqlite3_column_int64(St, 0);
+          if not All and ((Id >= Length(Want)) or not Want[Id]) then
+            Continue;
           if n >= Length(Ids) then
             SetLength(Ids, Max(1024, n * 2));
-          Ids[n] := sqlite3_column_int64(St, 0);
+          Ids[n] := Id;
           Paths.Add(StrPas(sqlite3_column_text(St, 1)));
           Inc(n);
         end;
@@ -482,12 +536,13 @@ begin
         end;
         sqlite3_finalize(St);
       end;
+      FJobTotal := n;
+      FJobDone := 0;
       i := 0;
-      while (i < n) and not Terminated do
+      while (i < n) and not Stopped do
       begin
-        sqlite3_exec(DB, 'BEGIN', nil, nil, nil);
         Batch := 0;
-        while (i < n) and (Batch < 16) and not Terminated do
+        while (i < n) and (Batch < 16) and not Stopped do
         begin
           PzInit(Img);
           nf := 0;
@@ -495,6 +550,9 @@ begin
             0, @Img, @M) >= 0 then
           begin
             nf := pz_ai_faces(Det, @Img, 960, 0.75, @F[0], Length(F));
+            { one short write transaction per photo, after the slow decode
+              and detection, so the other writers are not kept waiting }
+            sqlite3_exec(DB, 'BEGIN IMMEDIATE', nil, nil, nil);
             for j := 0 to nf - 1 do
             begin
               g := 0;
@@ -554,19 +612,24 @@ begin
               Inc(FFaces);
             end;
             pz_free(@Img);
-          end;
+          end
+          else
+            sqlite3_exec(DB, 'BEGIN IMMEDIATE', nil, nil, nil);
           sqlite3_reset(Scan);
           sqlite3_bind_int64(Scan, 1, Ids[i]);
           sqlite3_bind_int(Scan, 2, Max(0, nf));
           sqlite3_step(Scan);
+          sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
           Inc(i);
           Inc(Batch);
           Inc(FDone);
+          Inc(FJobDone);
         end;
-        sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
         FChanged := True;
       end;
-      if not Terminated then
+      FJobTotal := 0;
+      FJobDone := 0;
+      if FAuto and not Terminated then
         FWake.WaitFor(60000);
     end;
     sqlite3_finalize(Ins);

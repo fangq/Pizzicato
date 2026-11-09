@@ -376,9 +376,10 @@ var
   Id: Int64;
   Img: Tpz_image;
   E: array[0..CLIP_DIM - 1] of Single;
-  Blob: array[0..CLIP_DIM + 3] of Byte;
+  Blob: array[0..63, 0..CLIP_DIM + 3] of Byte;
+  BId: array[0..63] of Int64;
   Err: string;
-  r: Integer;
+  r, nb: Integer;
 begin
   H := nil;
   DB := nil;
@@ -457,7 +458,9 @@ begin
       k := n - 1;
       while (k >= 0) and not Terminated do
       begin
-        sqlite3_exec(DB, 'BEGIN', nil, nil, nil);
+        { embed outside any transaction, then write the batch in one short
+          write transaction (see pzcaption: SQLITE_BUSY_SNAPSHOT) }
+        nb := 0;
         for i := 0 to 63 do
         begin
           if (k < 0) or Terminated then
@@ -467,10 +470,15 @@ begin
           sqlite3_reset(Get);
           sqlite3_bind_int64(Get, 1, Id);
           if sqlite3_step(Get) <> SQLITE_ROW then
+          begin
+            sqlite3_reset(Get);
             Continue;
+          end;
           PzInit(Img);
-          if pz_decode_jpeg_mem(sqlite3_column_blob(Get, 0),
-            sqlite3_column_bytes(Get, 0), 0, 0, 0, @Img) <> 0 then
+          r := pz_decode_jpeg_mem(sqlite3_column_blob(Get, 0),
+            sqlite3_column_bytes(Get, 0), 0, 0, 0, @Img);
+          sqlite3_reset(Get); // do not keep a read open
+          if r <> 0 then
             Continue;
           r := pz_ai_clip_image(H, @Img, @E[0]);
           pz_free(@Img);
@@ -479,16 +487,25 @@ begin
           Add(Id, E, nil);
           FLock.Enter;
           r := FRow[Id];
-          Move(FScale[r], Blob[0], 4);
-          Move(FVec[r * CLIP_DIM], Blob[4], CLIP_DIM);
+          Move(FScale[r], Blob[nb, 0], 4);
+          Move(FVec[r * CLIP_DIM], Blob[nb, 4], CLIP_DIM);
           FLock.Leave;
-          sqlite3_reset(Ins);
-          sqlite3_bind_int64(Ins, 1, Id);
-          sqlite3_bind_blob(Ins, 2, @Blob[0], CLIP_DIM + 4, nil);
-          sqlite3_step(Ins);
-          Inc(FAdded);
+          BId[nb] := Id;
+          Inc(nb);
         end;
-        sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
+        if nb > 0 then
+        begin
+          sqlite3_exec(DB, 'BEGIN IMMEDIATE', nil, nil, nil);
+          for i := 0 to nb - 1 do
+          begin
+            sqlite3_reset(Ins);
+            sqlite3_bind_int64(Ins, 1, BId[i]);
+            sqlite3_bind_blob(Ins, 2, @Blob[i, 0], CLIP_DIM + 4, nil);
+            sqlite3_step(Ins);
+          end;
+          sqlite3_exec(DB, 'COMMIT', nil, nil, nil);
+          Inc(FAdded, nb);
+        end;
       end;
       if not Terminated then
         FWake.WaitFor(30000); // new thumbnails show up as they are made

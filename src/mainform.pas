@@ -85,6 +85,11 @@ type
     MiOpen, MiZoom, MiPastePhoto, MiPasteView: TMenuItem;
     MiHidePhoto, MiHideView: TMenuItem;
     MiFSelect, MiFHold, MiFExport, MiFDesc, MiFShow, MiFCopy, MiFRescan: TMenuItem;
+    { manual face finding / scene summaries (--autoface off, --autoscene off) }
+    MiFaces, MiDescribe, MiAIStop, MiVFaces, MiVDescribe, MiVAIStop: TMenuItem;
+    MiFFaces, MiFDescribe, MiFFacesAll, MiFDescribeAll, MiFAIStop, MiFAISep: TMenuItem;
+    MiAISep, MiVAISep: TMenuItem;
+    FAutoFace, FAutoScene: Boolean;
     FMenuFolder: TPzFolder;
     FEditsClip: string;      // "Copy Edits": a filter chain
     ChkRawPreview: TCheckBox;
@@ -240,6 +245,15 @@ type
     procedure MFRescanClick(Sender: TObject);
     procedure MFExpandClick(Sender: TObject);
     procedure MFCollapseClick(Sender: TObject);
+    procedure AIMenuState;
+    procedure RequestAI(L: TList; Faces: Boolean);
+    procedure MFacesClick(Sender: TObject);
+    procedure MDescribeClick(Sender: TObject);
+    procedure MFFacesClick(Sender: TObject);
+    procedure MFDescribeClick(Sender: TObject);
+    procedure MFFacesAllClick(Sender: TObject);
+    procedure MFDescribeAllClick(Sender: TObject);
+    procedure MAIStopClick(Sender: TObject);
     procedure CaptionKeyPress(Sender: TObject; var Key: Char);
     procedure CaptionExit(Sender: TObject);
     procedure SaveCaption;
@@ -412,10 +426,22 @@ begin
   end;
   CfgDir := GetEnvironmentVariable('HOME') + '/.config/pizzicato';
   LogPath := '';
+  FAutoFace := True;
+  FAutoScene := True;
   for i := 1 to ParamCount do
   begin
     A := ParamStr(i);
-    if A = '--bench' then
+    { --autoface on|off, --autoscene on|off (also --autoface=off) }
+    if (A = '--autoface') or (A = '--autoscene') then
+      A := A + '=' + ParamStr(i + 1);
+    if (Copy(A, 1, 11) = '--autoface=') or (Copy(A, 1, 12) = '--autoscene=') then
+    begin
+      if Pos('face', A) > 0 then
+        FAutoFace := not SameText(Copy(A, 12, MaxInt), 'off')
+      else
+        FAutoScene := not SameText(Copy(A, 13, MaxInt), 'off');
+    end
+    else if A = '--bench' then
       FBench := True
     else if Copy(A, 1, 8) = '--bench=' then
     begin
@@ -451,6 +477,9 @@ begin
   for i := 1 to ParamCount do
   begin
     A := ParamStr(i);
+    if (i > 1) and ((ParamStr(i - 1) = '--autoface') or
+      (ParamStr(i - 1) = '--autoscene')) then
+      Continue; // their on/off
     if (A <> '') and (A[1] <> '-') and DirectoryExists(A) then
       Lib.AddRoot(ExcludeTrailingPathDelimiter(ExpandFileName(A)))
     else if (A <> '') and (A[1] <> '-') and FileExists(A) then
@@ -1194,7 +1223,7 @@ var
   Why: string;
 begin
   if (CapIdx = nil) and not FGenAll and PzCaptionReady(Why) then
-    CapIdx := TPzCaptionIndex.Create(FDBPath);
+    CapIdx := TPzCaptionIndex.Create(FDBPath, FAutoScene or FBench);
 end;
 
 { give the photos their captions, for the search box; a search in
@@ -1234,7 +1263,7 @@ var
 begin
   if (FaceIdx = nil) and not FGenAll and PzFacesReady(Why) then
   begin
-    FaceIdx := TPzFaceIndex.Create(FDBPath);
+    FaceIdx := TPzFaceIndex.Create(FDBPath, FAutoFace or FBench);
     LoadPeopleNames;
     RebuildPeople;
   end;
@@ -3065,8 +3094,11 @@ begin
     S := 'Scanning folders… ';
   if (Lib.GenTotal > 0) and (Lib.GenDone < Lib.GenTotal) then
     S := S + Format('Building thumbnails %d / %d', [Lib.GenDone, Lib.GenTotal]);
-  if (FaceIdx <> nil) and (FaceIdx.Total > 0) and (FaceIdx.Done < FaceIdx.Total) then
-    S := S + Format('  Finding faces %d / %d', [FaceIdx.Done, FaceIdx.Total]);
+  if (FaceIdx <> nil) and FaceIdx.Auto and (FaceIdx.Total > 0) and
+    (FaceIdx.Done < FaceIdx.Total) then
+    S := S + Format('  Finding faces %d / %d', [FaceIdx.Done, FaceIdx.Total])
+  else if (FaceIdx <> nil) and (FaceIdx.JobDone < FaceIdx.JobTotal) then
+    S := S + Format('  Finding faces %d / %d', [FaceIdx.JobDone, FaceIdx.JobTotal]);
   { new groups show up under People now and then }
   Inc(FPeopleTick);
   if (FaceIdx <> nil) and FaceIdx.Changed and (FPeopleTick mod 30 = 0) and not
@@ -3078,8 +3110,11 @@ begin
   if (ClipIdx <> nil) and (ClipIdx.Total > 0) and (ClipIdx.Indexed < ClipIdx.Total) then
     S := S + Format('  Indexing for smart search %d / %d',
       [ClipIdx.Indexed, ClipIdx.Total]);
-  if (CapIdx <> nil) and (CapIdx.Total > 0) and (CapIdx.Done < CapIdx.Total) then
-    S := S + Format('  Describing photos %d / %d', [CapIdx.Done, CapIdx.Total]);
+  if (CapIdx <> nil) and CapIdx.Auto and (CapIdx.Total > 0) and
+    (CapIdx.Done < CapIdx.Total) then
+    S := S + Format('  Describing photos %d / %d', [CapIdx.Done, CapIdx.Total])
+  else if (CapIdx <> nil) and (CapIdx.JobDone < CapIdx.JobTotal) then
+    S := S + Format('  Describing photos %d / %d', [CapIdx.JobDone, CapIdx.JobTotal]);
   { new captions join the search now and then }
   if (CapIdx <> nil) and (CapIdx.Added <> FCapSeen) and
     ((FCapSeen = 0) or (FPeopleTick mod 30 = 0)) and not FEditMode then
@@ -4361,6 +4396,11 @@ begin
   AddMI(PmPhoto, '-', '', '', nil);
   AddMI(PmPhoto, 'Select All in Folder', 'library', 'Ctrl+A', @MSelectAllClick);
   AddMI(PmPhoto, 'Properties', 'info', '', @MPropsClick);
+  MiAISep := AddMI(PmPhoto, '-', '', '', nil);
+  MiFaces := AddMI(PmPhoto, 'Find Faces', 'people', '', @MFacesClick);
+  MiDescribe := AddMI(PmPhoto, 'Describe Scene', 'search', '', @MDescribeClick);
+  MiAIStop := AddMI(PmPhoto, 'Stop Finding Faces / Describing', 'cancel',
+    '', @MAIStopClick);
 
   { the photo view }
   PmView := TPopupMenu.Create(Self);
@@ -4385,6 +4425,11 @@ begin
   AddMI(PmView, 'Delete from Disk…', 'trash', 'Del', @MDeleteClick);
   AddMI(PmView, '-', '', '', nil);
   AddMI(PmView, 'Properties', 'info', '', @MPropsClick);
+  MiVAISep := AddMI(PmView, '-', '', '', nil);
+  MiVFaces := AddMI(PmView, 'Find Faces', 'people', '', @MFacesClick);
+  MiVDescribe := AddMI(PmView, 'Describe Scene', 'search', '', @MDescribeClick);
+  MiVAIStop := AddMI(PmView, 'Stop Finding Faces / Describing', 'cancel',
+    '', @MAIStopClick);
 
   { an album: in the folder list or a folder header in the grid }
   PmPeople := TPopupMenu.Create(Self);
@@ -4401,6 +4446,15 @@ begin
   AddMI(PmFolder, '-', '', '', nil);
   AddMI(PmFolder, 'Expand All Years', 'calendar', '', @MFExpandClick);
   AddMI(PmFolder, 'Collapse All Years', 'calendar', '', @MFCollapseClick);
+  MiFAISep := AddMI(PmFolder, '-', '', '', nil);
+  MiFFaces := AddMI(PmFolder, 'Find Faces in Album', 'people', '', @MFFacesClick);
+  MiFDescribe := AddMI(PmFolder, 'Describe Album', 'search', '', @MFDescribeClick);
+  MiFFacesAll := AddMI(PmFolder, 'Find Faces in All Photos', 'people',
+    '', @MFFacesAllClick);
+  MiFDescribeAll := AddMI(PmFolder, 'Describe All Photos', 'search',
+    '', @MFDescribeAllClick);
+  MiFAIStop := AddMI(PmFolder, 'Stop Finding Faces / Describing',
+    'cancel', '', @MAIStopClick);
 end;
 
 { what a photo menu acts on: the selection, or the photo being edited }
@@ -4459,6 +4513,7 @@ begin
       Grid.Select(P); // right-click on another photo selects it, as in Picasa
     MiPastePhoto.Enabled := FEditsClip <> '';
     SetHideCaption(MiHidePhoto);
+    AIMenuState;
     PmPhoto.PopUp;
     Exit;
   end;
@@ -4479,6 +4534,7 @@ begin
     MiZoom.Caption := 'Actual Pixels (1:1)';
   MiPasteView.Enabled := FEditsClip <> '';
   SetHideCaption(MiHideView);
+  AIMenuState;
   PmView.PopUp;
 end;
 
@@ -4519,6 +4575,9 @@ begin
   MiFShow.Enabled := Ok;
   MiFCopy.Enabled := Ok;
   MiFRescan.Enabled := Ok;
+  AIMenuState;
+  MiFFaces.Enabled := Ok;
+  MiFDescribe.Enabled := Ok;
   PmFolder.PopUp;
 end;
 
@@ -5031,6 +5090,111 @@ end;
 procedure TMainForm.MFCollapseClick(Sender: TObject);
 begin
   Tree.FullCollapse;
+end;
+
+{ the manual face/scene items show only when that indexer is manual
+  (--autoface off, --autoscene off) and its model is installed }
+procedure TMainForm.AIMenuState;
+var
+  F, C, Busy: Boolean;
+begin
+  F := (FaceIdx <> nil) and not FaceIdx.Auto;
+  C := (CapIdx <> nil) and not CapIdx.Auto;
+  Busy := (F and (FaceIdx.JobDone < FaceIdx.JobTotal)) or
+    (C and (CapIdx.JobDone < CapIdx.JobTotal));
+  MiFaces.Visible := F;
+  MiVFaces.Visible := F;
+  MiFFaces.Visible := F;
+  MiFFacesAll.Visible := F;
+  MiDescribe.Visible := C;
+  MiVDescribe.Visible := C;
+  MiFDescribe.Visible := C;
+  MiFDescribeAll.Visible := C;
+  MiFAISep.Visible := F or C;
+  MiAISep.Visible := F or C;
+  MiVAISep.Visible := F or C;
+  MiAIStop.Visible := Busy;
+  MiVAIStop.Visible := Busy;
+  MiFAIStop.Visible := Busy;
+end;
+
+procedure TMainForm.RequestAI(L: TList; Faces: Boolean);
+var
+  i: Integer;
+begin
+  for i := 0 to L.Count - 1 do
+    if Faces and (FaceIdx <> nil) then
+      FaceIdx.Request(TPzPhoto(L[i]).Id)
+    else if not Faces and (CapIdx <> nil) then
+      CapIdx.Request(TPzPhoto(L[i]).Id);
+end;
+
+procedure TMainForm.MFacesClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    RequestAI(L, True);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MDescribeClick(Sender: TObject);
+var
+  L: TList;
+begin
+  L := TList.Create;
+  try
+    TargetPhotos(L);
+    RequestAI(L, False);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MFFacesClick(Sender: TObject);
+var
+  L: TList;
+  k: Integer;
+begin
+  if FMenuFolder = nil then
+    Exit;
+  L := TList.Create;
+  try
+    for k := 0 to FMenuFolder.Count - 1 do
+      L.Add(FMenuFolder.Photo(k));
+    RequestAI(L, Sender = MiFFaces);
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TMainForm.MFDescribeClick(Sender: TObject);
+begin
+  MFFacesClick(Sender);
+end;
+
+procedure TMainForm.MFFacesAllClick(Sender: TObject);
+begin
+  if FaceIdx <> nil then
+    FaceIdx.RequestAll;
+end;
+
+procedure TMainForm.MFDescribeAllClick(Sender: TObject);
+begin
+  if CapIdx <> nil then
+    CapIdx.RequestAll;
+end;
+
+procedure TMainForm.MAIStopClick(Sender: TObject);
+begin
+  if FaceIdx <> nil then
+    FaceIdx.Cancel;
+  if CapIdx <> nil then
+    CapIdx.Cancel;
 end;
 
 {$I pzbench.inc}

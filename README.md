@@ -140,6 +140,16 @@ Without arguments it uses the roots saved via *Add Folder…*, or `~/Pictures`.
 The cache defaults to `$XDG_CACHE_HOME/pizzicato/library.db`. Keep it on a
 local disk, because SQLite WAL on NFS is slow and unsafe.
 
+    ./pizzicato --autoface off --autoscene off   # no face finding / scene summaries in the background
+
+By default (`on`), faces are found and photos described in the background as
+soon as their models are installed. With `off`, nothing runs until you ask.
+Right-click photos for **Find Faces** and **Describe Scene**. Right-click an
+album for the same over the album or **All Photos**. **Stop Finding Faces /
+Describing** cancels a run. The results made so far are still loaded, so People,
+the "Scene" row in Properties, and search keep working. The models are put on
+the GPU only once there is work.
+
 ### Keys
 
 | Where   | Key                         | Action                         |

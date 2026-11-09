@@ -47,8 +47,7 @@ const
     Bytes: 152603577; Sha256:
     'fcb1507bcaf175c617045413f8f3e43c94b84130ac08d91ce94ad05ac1d4ffa7';
     Files: 'mobilesam_enc.mnn mobilesam_dec2.mnn mobilesam_dec3.mnn mobilesam_dec4.mnn '
-    +
-    'mobilesam_dec5.mnn mobilesam_dec6.mnn lama.mnn'),
+    + 'mobilesam_dec5.mnn mobilesam_dec6.mnn lama.mnn'),
     (Name: 'search'; Title: 'Smart search'; Zip: 'pizzicato-search-v1.zip';
     Bytes: 279939497; Sha256:
     '98621d194efbb9d72bdd4b18b608e44a46e21f3a2131a0cca40d8ef96f323da4';
@@ -335,8 +334,8 @@ begin
   for b := 0 to High(PZ_BUNDLES) do
   begin
     Inst := BundleInstalled(b);
-    Lst.Items[b] := PZ_BUNDLES[b].Title + '   ' +
-      IfThen(Inst, '(installed)', MB(PZ_BUNDLES[b].Bytes));
+    Lst.Items[b] := PZ_BUNDLES[b].Title + '   ' + IfThen(Inst,
+      '(installed)', MB(PZ_BUNDLES[b].Bytes));
     Lst.ItemEnabled[b] := not Inst;
     if Inst then
       Lst.Checked[b] := True
