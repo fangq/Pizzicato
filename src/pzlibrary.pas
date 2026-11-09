@@ -101,9 +101,15 @@ type
     function Photo(i: Integer): TPzPhoto; inline;
     function Count: Integer; inline;
     procedure EnsureIni;
+    { the ini was rewritten by someone else (Picasa): read it again }
+    procedure RefreshIni;
     procedure SavePhotoEdits(P: TPzPhoto);
     procedure SetDescription(const S: string);
     procedure FlushIni;
+  private
+    FMigrate: Boolean;   // .pizzi.ini merged into .picasa.ini, not yet saved
+    procedure LoadFields;
+    procedure SwitchToPicasa;
   end;
 
   TPzJobKind = (jkThumb, jkGen, jkView, jkProbe);
@@ -437,16 +443,53 @@ begin
   Result := Photos.Count;
 end;
 
-procedure TPzFolder.EnsureIni;
+{ The edits live in the folder's .picasa.ini, where Picasa keeps them. A
+  folder without one gets a .pizzi.ini instead (same format), so Pizzicato
+  never creates Picasa's file. Once Picasa makes a .picasa.ini there, the
+  .pizzi.ini entries it lacks are merged into it, and the .pizzi.ini is
+  renamed .pizzi.ini.bak after the merge is saved. }
+function OpenFolderIni(const Dir: string; out Merged: Boolean): TPzIni;
 var
-  i: Integer;
-  P: TPzPhoto;
+  Extra: TPzIni;
+begin
+  Merged := False;
+  if FileExists(Dir + '/' + PZ_PICASA_INI) then
+  begin
+    Result := TPzIni.Create(Dir + '/' + PZ_PICASA_INI);
+    Result.Load;
+    if FileExists(Dir + '/' + PZ_PIZZI_INI) then
+    begin
+      Extra := TPzIni.Create(Dir + '/' + PZ_PIZZI_INI);
+      try
+        Extra.Load;
+        Result.MergeFrom(Extra);
+      finally
+        Extra.Free;
+      end;
+      Merged := True;
+    end;
+  end
+  else
+  begin
+    Result := TPzIni.Create(Dir + '/' + PZ_PIZZI_INI);
+    Result.Load;
+  end;
+end;
+
+procedure TPzFolder.EnsureIni;
 begin
   if IniLoaded then
     Exit;
   IniLoaded := True;
-  Ini := TPzIni.Create(Path + '/.picasa.ini');
-  Ini.Load;
+  Ini := OpenFolderIni(Path, FMigrate);
+  LoadFields;
+end;
+
+procedure TPzFolder.LoadFields;
+var
+  i: Integer;
+  P: TPzPhoto;
+begin
   Description := Ini.ReadValue('Picasa', 'description');
   for i := 0 to Count - 1 do
   begin
@@ -486,12 +529,60 @@ begin
   Ini.WriteValue(P.Name, 'caption', P.Caption);
 end;
 
-procedure TPzFolder.FlushIni;
+procedure TPzFolder.RefreshIni;
 begin
-  if PzIniReadOnly then
+  if not IniLoaded then
     Exit;
-  if (Ini <> nil) and Ini.Dirty then
-    Ini.Save;
+  { Picasa made a .picasa.ini since: move over to it }
+  if (ExtractFileName(Ini.Path) = PZ_PIZZI_INI) and
+    FileExists(Path + '/' + PZ_PICASA_INI) then
+  begin
+    SwitchToPicasa;
+    LoadFields;
+  end
+  else if Ini.Refresh then
+    LoadFields;
+  Ini.Reloaded := False;
+end;
+
+procedure TPzFolder.FlushIni;
+var
+  Pizzi: string;
+begin
+  if PzIniReadOnly or (Ini = nil) then
+    Exit;
+  if (ExtractFileName(Ini.Path) = PZ_PIZZI_INI) and
+    FileExists(Path + '/' + PZ_PICASA_INI) then
+  begin
+    SwitchToPicasa;
+    { the photos must show the merged file: SavePhotoEdits writes every
+      field, and a stale one would undo Picasa's value }
+    LoadFields;
+  end;
+  if Ini.Dirty and not Ini.Save then
+    Exit;
+  if Ini.Reloaded then
+  begin
+    Ini.Reloaded := False;
+    LoadFields; // the photos show what is in the file now
+  end;
+  Pizzi := Path + '/' + PZ_PIZZI_INI;
+  if FMigrate and FileExists(Pizzi) then
+    RenameFile(Pizzi, Pizzi + '.bak');
+  FMigrate := False;
+end;
+
+{ the .pizzi.ini in use, and its unsaved changes, go into the new .picasa.ini }
+procedure TPzFolder.SwitchToPicasa;
+var
+  New: TPzIni;
+begin
+  New := TPzIni.Create(Path + '/' + PZ_PICASA_INI);
+  New.Load;
+  New.MergeFrom(Ini);
+  Ini.Free;
+  Ini := New;
+  FMigrate := True;
 end;
 
 { TPzResult }
@@ -659,18 +750,20 @@ begin
     sqlite3_close(FDB);
 end;
 
-{ the photos a folder's .picasa.ini marks hidden=yes (nil if none) }
+{ the photos a folder's .picasa.ini (or .pizzi.ini) marks hidden=yes (nil
+  if none) }
 function ReadHiddenNames(const Dir: string): TStringList;
 var
   Ini: TPzIni;
   i: Integer;
+  Merged: Boolean;
 begin
   Result := nil;
-  if not FileExists(Dir + '/.picasa.ini') then
+  if not FileExists(Dir + '/' + PZ_PICASA_INI) and not
+    FileExists(Dir + '/' + PZ_PIZZI_INI) then
     Exit;
-  Ini := TPzIni.Create(Dir + '/.picasa.ini');
+  Ini := OpenFolderIni(Dir, Merged);
   try
-    Ini.Load;
     for i := 0 to Ini.Count - 1 do
       if Ini.ReadValue(Ini.Sections[i].Name, 'hidden') = 'yes' then
       begin

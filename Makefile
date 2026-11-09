@@ -72,7 +72,7 @@ pretty-pas:
 	@echo "  PRETTY  Pascal sources"
 
 test: build/test_ini
-	@test -n "$(INI)" || { echo 'usage: make test INI="copy1.ini copy2.ini ..." (files are rewritten)'; exit 1; }
+	@test -n "$(INI)" || echo 'only the built-in tests: make test INI="copy1.ini copy2.ini ..." also round-trips copies of real files (they are rewritten)'
 	build/test_ini $(INI)
 
 build/test_ini: tests/test_ini.pas src/pzini.pas

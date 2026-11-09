@@ -2,7 +2,12 @@
 
   Pizzicato never modifies image files. Edits live in the per-folder
   .picasa.ini exactly where Picasa keeps them, so edits made in Picasa show
-  up here and vice versa. Unknown sections and keys are preserved verbatim. }
+  up here and vice versa. Unknown sections and keys are preserved verbatim.
+
+  Another program (Picasa) may rewrite the file while it is loaded here, so
+  the changes made here are logged as key-level operations: when the file
+  on disk is newer than the copy in memory, it is read again and only those
+  operations are replayed onto it before saving. }
 unit pzini;
 
 {$mode objfpc}{$H+}
@@ -10,7 +15,13 @@ unit pzini;
 interface
 
 uses
-  Classes, SysUtils;
+  Classes, SysUtils, BaseUnix;
+
+const
+  PZ_PICASA_INI = '.picasa.ini';
+  { a folder without a .picasa.ini keeps Pizzicato's edits here, in the same
+    format: Pizzicato never creates Picasa's file }
+  PZ_PIZZI_INI = '.pizzi.ini';
 
 type
   { One filter of a chain, e.g. "finetune2=1,0.4,0,0,00000000,0" }
@@ -27,6 +38,18 @@ type
     destructor Destroy; override;
   end;
 
+  { what the file on disk was when it was read or written here }
+  TPzFileStamp = record
+    Exists: Boolean;
+    Size, MTime, MNsec, Ino: Int64;
+  end;
+
+  { a change made here: Value set (or the key deleted) }
+  TPzIniOp = record
+    Section, Key, Value: string;
+    Del: Boolean;
+  end;
+
   { TPzIni }
 
   TPzIni = class
@@ -35,20 +58,38 @@ type
     FSections: TList;
     FCRLF: Boolean;
     FDirty: Boolean;
+    FStamp: TPzFileStamp;
+    FOps: array of TPzIniOp;   // the changes not saved yet, oldest first
+    FReloaded: Boolean;
     function GetCount: Integer;
     function GetSection(i: Integer): TPzIniSection;
+    procedure Clear;
+    procedure Read;
+    procedure LogOp(const ASection, AKey, AValue: string; ADel: Boolean);
+    procedure SetValue(const ASection, AKey, AValue: string);
+    procedure RemoveKey(const ASection, AKey: string);
   public
     constructor Create(const APath: string);
     destructor Destroy; override;
     procedure Load;
+    { the file was written by someone else since it was read here: read it
+      again and replay the changes not saved yet; True if it was }
+    function Refresh: Boolean;
+    function ChangedOnDisk: Boolean;
+    { writes the changes, on top of the newest file on disk }
     function Save: Boolean;
+    { take the keys of Src this file lacks, then Src's unsaved changes }
+    procedure MergeFrom(Src: TPzIni);
     function Find(const ASection: string; ACreate: Boolean = False): TPzIniSection;
     function ReadValue(const ASection, AKey: string;
       const ADefault: string = ''): string;
+    function HasKey(const ASection, AKey: string): Boolean;
     procedure WriteValue(const ASection, AKey, AValue: string);
     procedure DeleteKey(const ASection, AKey: string);
     property Path: string read FPath;
     property Dirty: Boolean read FDirty write FDirty;
+    { set when Refresh or Save read the file again (cleared by the caller) }
+    property Reloaded: Boolean read FReloaded write FReloaded;
     property Count: Integer read GetCount;
     property Sections[i: Integer]: TPzIniSection read GetSection;
   end;
@@ -96,13 +137,44 @@ begin
 end;
 
 destructor TPzIni.Destroy;
+begin
+  Clear;
+  FSections.Free;
+  inherited Destroy;
+end;
+
+procedure TPzIni.Clear;
 var
   i: Integer;
 begin
   for i := 0 to FSections.Count - 1 do
     TPzIniSection(FSections[i]).Free;
-  FSections.Free;
-  inherited Destroy;
+  FSections.Clear;
+end;
+
+function StampOf(const APath: string): TPzFileStamp;
+var
+  St: Stat;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  if FpStat(APath, St) <> 0 then
+    Exit;
+  Result.Exists := True;
+  Result.Size := St.st_size;
+  Result.MTime := St.st_mtime;
+  Result.MNsec := St.st_mtime_nsec;
+  Result.Ino := St.st_ino;
+end;
+
+function SameStamp(const A, B: TPzFileStamp): Boolean;
+begin
+  Result := (A.Exists = B.Exists) and (A.Size = B.Size) and
+    (A.MTime = B.MTime) and (A.MNsec = B.MNsec) and (A.Ino = B.Ino);
+end;
+
+function TPzIni.ChangedOnDisk: Boolean;
+begin
+  Result := not SameStamp(StampOf(FPath), FStamp);
 end;
 
 function TPzIni.GetCount: Integer;
@@ -116,6 +188,14 @@ begin
 end;
 
 procedure TPzIni.Load;
+begin
+  FOps := nil;
+  Read;
+  FDirty := False;
+end;
+
+{ (re)read the file; the unsaved changes are kept in FOps }
+procedure TPzIni.Read;
 var
   SL: TStringList;
   i: Integer;
@@ -124,7 +204,9 @@ var
   Raw: string;
   F: TFileStream;
 begin
-  if not FileExists(FPath) then
+  Clear;
+  FStamp := StampOf(FPath);
+  if not FStamp.Exists then
     Exit;
   SL := TStringList.Create;
   try
@@ -158,7 +240,50 @@ begin
   finally
     SL.Free;
   end;
-  FDirty := False;
+end;
+
+function TPzIni.Refresh: Boolean;
+var
+  i: Integer;
+begin
+  Result := ChangedOnDisk;
+  if not Result then
+    Exit;
+  Read;
+  for i := 0 to High(FOps) do
+    if FOps[i].Del then
+      RemoveKey(FOps[i].Section, FOps[i].Key)
+    else
+      SetValue(FOps[i].Section, FOps[i].Key, FOps[i].Value);
+  FReloaded := True;
+end;
+
+procedure TPzIni.MergeFrom(Src: TPzIni);
+var
+  i, j: Integer;
+  Sec: TPzIniSection;
+  K: string;
+begin
+  for i := 0 to Src.Count - 1 do
+  begin
+    Sec := Src.Sections[i];
+    if Find(Sec.Name) = nil then
+    begin
+      Find(Sec.Name, True); // keep empty sections too
+      FDirty := True;
+    end;
+    for j := 0 to Sec.Lines.Count - 1 do
+    begin
+      K := Sec.Lines.Names[j];
+      if (K <> '') and not HasKey(Sec.Name, K) then
+        WriteValue(Sec.Name, K, Sec.Lines.ValueFromIndex[j]);
+    end;
+  end;
+  for i := 0 to High(Src.FOps) do
+    if Src.FOps[i].Del then
+      DeleteKey(Src.FOps[i].Section, Src.FOps[i].Key)
+    else
+      WriteValue(Src.FOps[i].Section, Src.FOps[i].Key, Src.FOps[i].Value);
 end;
 
 function TPzIni.Save: Boolean;
@@ -172,6 +297,8 @@ begin
   Result := True;
   if not FDirty then
     Exit;
+  { someone else wrote the file since: start from theirs }
+  Refresh;
   if FCRLF then
     EOL := #13#10
   else
@@ -195,17 +322,23 @@ begin
     finally
       F.Free;
     end;
-    Result := RenameFile(Tmp, FPath);
-    if not Result then
+    { written meanwhile (a very narrow window): merge again }
+    if ChangedOnDisk then
     begin
-      DeleteFile(FPath);
-      Result := RenameFile(Tmp, FPath);
+      DeleteFile(Tmp);
+      Result := Save;
+      Exit;
     end;
+    Result := RenameFile(Tmp, FPath);
   except
     Result := False;
   end;
   if Result then
+  begin
     FDirty := False;
+    FOps := nil;
+    FStamp := StampOf(FPath);
+  end;
 end;
 
 function TPzIni.Find(const ASection: string; ACreate: Boolean): TPzIniSection;
@@ -223,6 +356,14 @@ begin
   end;
 end;
 
+function TPzIni.HasKey(const ASection, AKey: string): Boolean;
+var
+  Sec: TPzIniSection;
+begin
+  Sec := Find(ASection);
+  Result := (Sec <> nil) and (Sec.Lines.IndexOfName(AKey) >= 0);
+end;
+
 function TPzIni.ReadValue(const ASection, AKey: string; const ADefault: string): string;
 var
   Sec: TPzIniSection;
@@ -237,16 +378,31 @@ begin
     Result := Sec.Lines.ValueFromIndex[i];
 end;
 
-procedure TPzIni.WriteValue(const ASection, AKey, AValue: string);
+procedure TPzIni.LogOp(const ASection, AKey, AValue: string; ADel: Boolean);
+var
+  i, n: Integer;
+begin
+  { one entry per key: the latest change }
+  n := Length(FOps);
+  for i := 0 to n - 1 do
+    if (FOps[i].Section = ASection) and SameText(FOps[i].Key, AKey) then
+    begin
+      FOps[i].Value := AValue;
+      FOps[i].Del := ADel;
+      Exit;
+    end;
+  SetLength(FOps, n + 1);
+  FOps[n].Section := ASection;
+  FOps[n].Key := AKey;
+  FOps[n].Value := AValue;
+  FOps[n].Del := ADel;
+end;
+
+procedure TPzIni.SetValue(const ASection, AKey, AValue: string);
 var
   Sec: TPzIniSection;
   i: Integer;
 begin
-  if AValue = '' then
-  begin
-    DeleteKey(ASection, AKey);
-    Exit;
-  end;
   Sec := Find(ASection, True);
   i := Sec.Lines.IndexOfName(AKey);
   if i >= 0 then
@@ -260,7 +416,7 @@ begin
   FDirty := True;
 end;
 
-procedure TPzIni.DeleteKey(const ASection, AKey: string);
+procedure TPzIni.RemoveKey(const ASection, AKey: string);
 var
   Sec: TPzIniSection;
   i: Integer;
@@ -274,6 +430,29 @@ begin
     Sec.Lines.Delete(i);
     FDirty := True;
   end;
+end;
+
+{ only real changes are logged: writing the value the file has is no
+  change, so a newer value written there by someone else is kept }
+procedure TPzIni.WriteValue(const ASection, AKey, AValue: string);
+begin
+  if AValue = '' then
+  begin
+    DeleteKey(ASection, AKey);
+    Exit;
+  end;
+  if HasKey(ASection, AKey) and (ReadValue(ASection, AKey) = AValue) then
+    Exit;
+  LogOp(ASection, AKey, AValue, False);
+  SetValue(ASection, AKey, AValue);
+end;
+
+procedure TPzIni.DeleteKey(const ASection, AKey: string);
+begin
+  if not HasKey(ASection, AKey) then
+    Exit;
+  LogOp(ASection, AKey, '', True);
+  RemoveKey(ASection, AKey);
 end;
 
 { chain helpers }

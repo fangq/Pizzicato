@@ -1866,6 +1866,9 @@ begin
       AIWorker.CancelOthers(P);
   end;
   Cur := P;
+  { edits made in Picasa since the folder was read show up now }
+  P.Folder.EnsureIni;
+  P.Folder.RefreshIni;
   Inc(ViewToken);
   TmrFull.Enabled := False;
   TmrFull.Enabled := True;

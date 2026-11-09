@@ -6,7 +6,9 @@ pixel kernels).
 
 * **Never touches your photos.** Edits are stored in the per-folder
   `.picasa.ini` files, in Picasa's own format, so edits made in Picasa
-  show up in Pizzicato and the other way round.
+  show up in Pizzicato and the other way round. A folder without a
+  `.picasa.ini` gets a `.pizzi.ini` instead, so Pizzicato never creates
+  Picasa's file.
 * **Picasa-style library**: every folder in one continuous scroll with folder
   headers, a year/folder tree, a thumbnail size slider, stars, and a
   "Starred only" filter. Hide/Unhide (Picasa's `hidden=yes`) takes photos out
@@ -171,6 +173,18 @@ the GPU only once there is work.
 | Editor  | Esc                         | leave 1:1 or crop, else back to library |
 
 ## Picasa compatibility
+
+- **Running Picasa at the same time is safe.** When Picasa rewrites a
+  `.picasa.ini` that Pizzicato has loaded, Pizzicato re-reads it when saving
+  and applies only its own changes on top. On the same key of the same
+  photo, Pizzicato's newer edit wins. Opening a photo in the editor also
+  picks up what Picasa changed.
+- **Folders without a `.picasa.ini`** get Pizzicato's edits in `.pizzi.ini`,
+  in the same format. If Picasa later creates a `.picasa.ini` there, the
+  first save merges in the `.pizzi.ini` entries it lacks (Picasa's own values
+  win) and renames the `.pizzi.ini` to `.pizzi.ini.bak`.
+- **Files are written atomically**, with only the changed keys rewritten.
+  Unknown sections and keys are kept, and so are the line endings (CRLF or LF).
 
 | `.picasa.ini` key / filter | Status |
 |---|---|
