@@ -93,7 +93,8 @@ begin
       pz_vignette(@Img, FArg(F, 0, 0.5))
     else if N = 'pzsoft' then
       pz_softfocus(@Img, FArg(F, 0, 0.5));
-    { retouch and unknown filters are kept in the chain but not rendered }
+    { pzdenoise and pzsr (AI) are applied by their callers, before and after
+      the chain; retouch and unknown filters are kept but not rendered }
   end;
   if Rotate <> 0 then
     pz_rotate90(@Img, Rotate);
@@ -127,7 +128,8 @@ function IsKnownFilter(const Name: string): Boolean;
 begin
   case Name of
     'fill', 'finetune2', 'autolight', 'autocolor', 'enhance', 'sat', 'Boost', 'bw',
-    'sepia', 'warm', 'unsharp2', 'tilt', 'crop64', 'pzbc', 'pzvignette', 'pzsoft':
+    'sepia', 'warm', 'unsharp2', 'tilt', 'crop64', 'pzbc', 'pzvignette', 'pzsoft',
+    'pzdenoise', 'pzsr':
       Result := True;
     else
       Result := False;

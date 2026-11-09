@@ -11,7 +11,7 @@ uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
   LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
   Buttons, ImgList, gdk2,
-  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons;
+  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai, md5;
 
 type
   TViewEntry = class
@@ -25,7 +25,7 @@ type
 
   TSliderKind = (skFill, skTilt, skTFill, skTHigh, skTShadow, skTTemp,
     skBright, skContrast,
-    skSharpen, skSat, skBoost, skSoft, skVignette);
+    skSharpen, skSat, skBoost, skSoft, skVignette, skDenoise);
 
   { TMainForm }
 
@@ -102,6 +102,24 @@ type
     TmrIni, TmrStatus: TTimer;
     TmrFull: TTimer;       // decodes full resolution once a photo has been looked at
     FFullReq: TPzPhoto;    // the photo whose full-resolution decode is queued
+    { AI: one GPU worker, recent results, the viewer's progress line }
+    AIWorker: TPzAIWorker;
+    FAICache: TList;       // finished TPzAIJobs, newest last
+    FAIDir: string;        // on-disk results, next to the thumbnail DB
+    FAIMsg, FBaseInfo: string;
+    PnlDenoise: TPanel;
+    ChkDenoiseHQ: TCheckBox;
+  private
+    procedure AIDone(J: TPzAIJob);
+    procedure AIProgress(ATag: Pointer; Done, Total: Integer);
+    function AIKey(P: TPzPhoto; K: TPzAIKind; W, H: Integer): string;
+    function AIFind(const Key: string): TPzAIJob;
+    procedure SetViewerInfo;
+    procedure DenoiseTileClick(Sender: TObject);
+    procedure DenoiseOffClick(Sender: TObject);
+    procedure DenoiseHQClick(Sender: TObject);
+    procedure SetDenoise(AOn: Boolean; Amount: Double; HQ: Boolean);
+  private
     { state }
     FEditMode: Boolean;
     Cur: TPzPhoto;
@@ -282,6 +300,7 @@ type
     procedure RunGenAllAsync(Data: PtrInt);
     procedure BenchViewer(F: TPzFolder; N: Integer; Dwell: Double);
     procedure BenchEdit(P: TPzPhoto);
+    procedure BenchAI(P: TPzPhoto);
   public
     constructor Create(TheOwner: TComponent); override;
     destructor Destroy; override;
@@ -372,6 +391,9 @@ begin
     FBenchLogOpen := True;
   end;
   Lib := TPzLibrary.Create(DBPath);
+  FAIDir := ExtractFileDir(DBPath) + '/ai';
+  FAICache := TList.Create;
+  pz_ai_set_cache_dir(PAnsiChar(ExtractFileDir(DBPath) + '/mnn'));
   Lib.OnResult := @LibResult;
   Lib.OnScanDir := @LibScanDir;
   Lib.OnScanDone := @LibScanDone;
@@ -773,6 +795,8 @@ begin
     'I''m Feeling Lucky: automatic contrast and colour', 168, 4);
   EffTile(P, 'Auto Contrast', 'autolight', 'Stretch the brightness range', 4, 80);
   EffTile(P, 'Auto Color', 'autocolor', 'Remove a colour cast', 86, 80);
+  AddTile(P, 'AI Denoise', 'denoise', 'Remove noise with a neural network (GPU)',
+    168, 80, @DenoiseTileClick);
 
   PnlCropOpts := TPanel.Create(Self);
   PnlCropOpts.Parent := TS;
@@ -796,6 +820,27 @@ begin
   BtnCropCancel := AddButton(PnlCropOpts, 'Cancel', 128, 40, 116,
     @CropCancelClick, 'cancel');
   BtnCrop := BtnCropApply; // kept for older code paths
+
+  PnlDenoise := TPanel.Create(Self);
+  PnlDenoise.Parent := TS;
+  PnlDenoise.Align := alTop;
+  PnlDenoise.Top := 1050;
+  PnlDenoise.Height := 92;
+  PnlDenoise.BevelOuter := bvNone;
+  PnlDenoise.ParentColor := True;
+  PnlDenoise.Visible := False;
+  Y := 4;
+  AddSlider(PnlDenoise, 'AI Denoise strength', 0, 100, skDenoise, Y);
+  ChkDenoiseHQ := TCheckBox.Create(Self);
+  ChkDenoiseHQ.Parent := PnlDenoise;
+  ChkDenoiseHQ.SetBounds(10, Y - 2, 140, 24);
+  ChkDenoiseHQ.Caption := 'High quality';
+  ChkDenoiseHQ.Hint := 'SCUNet instead of NAFNet: a little better, about 3x slower';
+  ChkDenoiseHQ.ShowHint := True;
+  ChkDenoiseHQ.Font.Color := clPzHeader;
+  ChkDenoiseHQ.OnChange := @DenoiseHQClick;
+  with AddButton(PnlDenoise, 'Remove', 150, Y - 2, 94, @DenoiseOffClick, 'cancel') do
+    Hint := 'Take the AI denoise off';
 
   PnlStraighten := TPanel.Create(Self);
   PnlStraighten.Parent := TS;
@@ -1277,7 +1322,11 @@ begin
   if (Cur <> nil) and (Cur <> P) then
     Viewer.SetMode(vmNormal);
   if Cur <> P then
+  begin
     FFullReq := nil;
+    if AIWorker <> nil then
+      AIWorker.CancelOthers(P);
+  end;
   Cur := P;
   Inc(ViewToken);
   TmrFull.Enabled := False;
@@ -1358,6 +1407,10 @@ var
   W, H: Integer;
   Info: string;
   HistData: Tpz_hist;
+  DAmt: Double;
+  DKind: TPzAIKind;
+  DKey, DWhy: string;
+  DJob: TPzAIJob;
 begin
   if Cur = nil then
     Exit;
@@ -1377,6 +1430,38 @@ begin
   T0 := NowSeconds;
   if pz_copy(@E.Img, @Img) <> 0 then
     Exit;
+  { AI denoise, the chain's first step: blend in the denoised base image,
+    or queue it on the GPU worker and show the photo as it is meanwhile }
+  FAIMsg := '';
+  if DenoiseOf(Cur.Filters, DAmt, DKind) and (E.Level >= 2) then
+  begin
+    DKey := AIKey(Cur, DKind, E.Img.w, E.Img.h);
+    DJob := AIFind(DKey);
+    if DJob <> nil then
+      PzMix(Img, DJob.Img, DAmt)
+    else if PzAIReady(DKind, DWhy) then
+    begin
+      if AIWorker = nil then
+      begin
+        AIWorker := TPzAIWorker.Create;
+        AIWorker.OnDone := @AIDone;
+        AIWorker.OnProgress := @AIProgress;
+      end;
+      if not AIWorker.Pending(DKey) then
+      begin
+        DJob := TPzAIJob.Create;
+        DJob.Kind := DKind;
+        DJob.Key := DKey;
+        DJob.Tag := Cur;
+        DJob.CachePath := FAIDir + '/' + MD5Print(MD5String(DKey)) + '.jpg';
+        pz_copy(@E.Img, @DJob.Img);
+        AIWorker.Submit(DJob);
+      end;
+      FAIMsg := Format('  ·  %s…', [PZ_AI_NAMES[DKind]]);
+    end
+    else
+      FAIMsg := '  ·  AI denoise unavailable';
+  end;
   RenderChain(Img, ParseChain(Cur.Filters), Cur.Rotate);
   if not Viewer.Zoom100 then
   begin
@@ -1421,9 +1506,152 @@ begin
     Info := '1:1 (drag to move, click to fit) · ' + Info
   else
     Info := 'fit · ' + Info;
-  Viewer.Info := Format('%dx%d  %s  ·  %s  ·  render %.0f ms',
+  FBaseInfo := Format('%dx%d  %s  ·  %s  ·  render %.0f ms',
     [Cur.W, Cur.H, Cur.Camera, Info, FLastRenderMs]);
+  SetViewerInfo;
+end;
+
+procedure TMainForm.SetViewerInfo;
+begin
+  Viewer.Info := FBaseInfo + FAIMsg;
   Viewer.Invalidate;
+end;
+
+{ ---------------- AI ---------------- }
+
+{ what an AI result is of: the file's version, the model and the input size }
+function TMainForm.AIKey(P: TPzPhoto; K: TPzAIKind; W, H: Integer): string;
+begin
+  Result := Format('%s|%d|%d|%s|%dx%d|%d', [P.Path, P.MTime, P.Size,
+    ExtractFileName(PzAIModelFile(K)), W, H, RawFlags]);
+end;
+
+function TMainForm.AIFind(const Key: string): TPzAIJob;
+var
+  i: Integer;
+begin
+  for i := FAICache.Count - 1 downto 0 do
+    if TPzAIJob(FAICache[i]).Key = Key then
+      Exit(TPzAIJob(FAICache[i]));
+  Result := nil;
+end;
+
+procedure TMainForm.AIDone(J: TPzAIJob);
+var
+  i, nBig: Integer;
+begin
+  if not J.OK then
+  begin
+    if (J.Tag = Pointer(Cur)) and (J.Error <> '') then
+    begin
+      FAIMsg := '  ·  ' + PZ_AI_NAMES[J.Kind] + ' failed: ' + J.Error;
+      SetViewerInfo;
+    end;
+    J.Free;
+    Exit;
+  end;
+  FAICache.Add(J);
+  { keep a few results; full-resolution ones are large }
+  repeat
+    nBig := 0;
+    for i := 0 to FAICache.Count - 1 do
+      if TPzAIJob(FAICache[i]).Img.w * TPzAIJob(FAICache[i]).Img.h > 4000000 then
+        Inc(nBig);
+    if (FAICache.Count <= 6) and (nBig <= 2) then
+      Break;
+    for i := 0 to FAICache.Count - 1 do
+      if (TPzAIJob(FAICache[i]) <> J) and ((FAICache.Count > 6) or
+        (TPzAIJob(FAICache[i]).Img.w * TPzAIJob(FAICache[i]).Img.h > 4000000)) then
+      begin
+        TPzAIJob(FAICache[i]).Free;
+        FAICache.Delete(i);
+        Break;
+      end;
+  until False;
+  if FBench then
+    BLog(Format('    %s %dx%d: %.0f ms%s', [PZ_AI_NAMES[J.Kind],
+      J.Img.w, J.Img.h, J.Seconds * 1000, IfThen(J.FromCache, ' (disk cache)', '')]));
+  if J.Tag = Pointer(Cur) then
+    QueueRender;
+end;
+
+procedure TMainForm.AIProgress(ATag: Pointer; Done, Total: Integer);
+begin
+  if (ATag <> Pointer(Cur)) or (Total <= 0) then
+    Exit;
+  FAIMsg := Format('  ·  AI working %d%%', [Done * 100 div Total]);
+  SetViewerInfo;
+end;
+
+procedure TMainForm.SetDenoise(AOn: Boolean; Amount: Double; HQ: Boolean);
+var
+  C: TPzChain;
+  i: Integer;
+begin
+  if Cur = nil then
+    Exit;
+  Cur.Folder.EnsureIni;
+  C := ParseChain(Cur.Filters);
+  { the denoise step always comes first: it works on the camera's image }
+  if (Length(C) > 0) and (C[0].Name = 'pzdenoise') then
+  begin
+    for i := 0 to High(C) - 1 do
+      C[i] := C[i + 1];
+    SetLength(C, Length(C) - 1);
+  end;
+  if AOn then
+  begin
+    SetLength(C, Length(C) + 1);
+    for i := High(C) downto 1 do
+      C[i] := C[i - 1];
+    C[0] := MakeFilter('pzdenoise', [FmtF(Amount), IntToStr(Ord(HQ))]);
+  end;
+  Cur.Filters := ChainToString(C);
+  EditsChanged(Cur);
+  LoadSlidersFromChain;
+end;
+
+procedure TMainForm.DenoiseTileClick(Sender: TObject);
+var
+  Why: string;
+  A: Double;
+  K: TPzAIKind;
+begin
+  if Cur = nil then
+    Exit;
+  if not PzAIReady(akDenoise, Why) then
+  begin
+    MessageDlg('AI Denoise', Why, mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if not DenoiseOf(Cur.Filters, A, K) then
+    SetDenoise(True, 0.8, False)
+  else
+    LoadSlidersFromChain;
+end;
+
+procedure TMainForm.DenoiseOffClick(Sender: TObject);
+begin
+  SetDenoise(False, 0, False);
+end;
+
+procedure TMainForm.DenoiseHQClick(Sender: TObject);
+var
+  A: Double;
+  K: TPzAIKind;
+  Why: string;
+begin
+  if FUpdatingUI or (Cur = nil) or not DenoiseOf(Cur.Filters, A, K) then
+    Exit;
+  if ChkDenoiseHQ.Checked and not PzAIReady(akDenoiseHQ, Why) then
+  begin
+    MessageDlg('AI Denoise', Why, mtInformation, [mbOK], 0);
+    FUpdatingUI := True;
+    ChkDenoiseHQ.Checked := False;
+    FUpdatingUI := False;
+    Exit;
+  end;
+  SetDenoise(True, A, ChkDenoiseHQ.Checked);
 end;
 
 procedure TMainForm.ViewerResize(Sender: TObject);
@@ -1440,6 +1668,8 @@ var
   L: TPzFilter;
   K: TSliderKind;
   Has: Boolean;
+  DA: Double;
+  DK: TPzAIKind;
 begin
   FUpdatingUI := True;
   try
@@ -1477,6 +1707,16 @@ begin
     else if L.Name = 'pzvignette' then Sliders[skVignette].Position :=
         Round(FArg(L, 0) * 100);
   finally
+    { the denoise step is first in the chain, not last }
+    if PnlDenoise <> nil then
+    begin
+      PnlDenoise.Visible := (Cur <> nil) and DenoiseOf(Cur.Filters, DA, DK);
+      if PnlDenoise.Visible then
+      begin
+        Sliders[skDenoise].Position := Round(DA * 100);
+        ChkDenoiseHQ.Checked := DK = akDenoiseHQ;
+      end;
+    end;
     FUpdatingUI := False;
   end;
 end;
@@ -1603,11 +1843,17 @@ begin
   if FUpdatingUI or (Cur = nil) then
     Exit;
   K := TSliderKind(TTrackBar(Sender).Tag);
+  if K = skDenoise then
+  begin
+    { the strength is a blend: no new step, and no recomputation }
+    SetDenoise(True, Sliders[skDenoise].Position / 100, ChkDenoiseHQ.Checked);
+    Exit;
+  end;
   { switching to a different filter kind: reset the other sliders so the UI
     shows what the new last step contains }
   FUpdatingUI := True;
   for Other := Low(TSliderKind) to High(TSliderKind) do
-    if Other <> K then
+    if (Other <> K) and (Other <> skDenoise) then
       case K of
         skTFill, skTHigh, skTShadow, skTTemp:
           if not (Other in [skTFill, skTHigh, skTShadow, skTTemp]) then
@@ -1885,12 +2131,14 @@ begin
       Break;
     if pz_load(PAnsiChar(Paths[i]), 0, 0, Flags, @Img, @M) >= 0 then
     begin
+      PzAIApplyChain(Img, Edits[i], nil);
       RenderChain(Img, ParseChain(Edits[i]), Rots[i]);
       pz_save_jpeg(PAnsiChar(Dests[i]), @Img, 92);
       pz_free(@Img);
     end;
     Done := i + 1;
   end;
+  PzAICloseThread;
 end;
 
 destructor TExportThread.Destroy;
@@ -2027,6 +2275,8 @@ begin
 end;
 
 procedure TMainForm.FormClose(Sender: TObject; var CloseAction: TCloseAction);
+var
+  i: Integer;
 begin
   TmrStatus.Enabled := False;
   TmrIni.Enabled := False;
@@ -2043,6 +2293,14 @@ begin
     Settings.WriteInteger('view', 'rightpanel', 2)
   else
     Settings.WriteInteger('view', 'rightpanel', 1);
+  if AIWorker <> nil then
+  begin
+    AIWorker.Stop;
+    FreeAndNil(AIWorker);
+  end;
+  for i := 0 to FAICache.Count - 1 do
+    TPzAIJob(FAICache[i]).Free;
+  FAICache.Clear;
   Lib.Shutdown;
   Lib.Free;
   Lib := nil;

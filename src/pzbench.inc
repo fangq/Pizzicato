@@ -129,7 +129,7 @@ procedure TMainForm.BenchEdit(P: TPzPhoto);
 const
   Names: array[TSliderKind] of string = ('Basic fill light', 'Straighten', 'Tuning fill', 'Highlights',
     'Shadows', 'Color temperature', 'Brightness', 'Contrast', 'Sharpen', 'Saturation', 'Boost',
-    'Soft focus', 'Vignette');
+    'Soft focus', 'Vignette', 'AI denoise');
 var
   OrigF, OrigR: string;
   K: TSliderKind;
@@ -171,7 +171,7 @@ begin
   P.Redo := '';
   LoadSlidersFromChain;
   { slider drags: 10 positions each, each re-renders the whole chain }
-  for K := Low(TSliderKind) to High(TSliderKind) do
+  for K := Low(TSliderKind) to Pred(skDenoise) do
   begin
     P.Filters := '';
     LoadSlidersFromChain;
@@ -273,6 +273,73 @@ begin
       Exit(F);
     end;
   end;
+end;
+
+{ AI denoise through the editor: screen size, then 1:1 full resolution, then
+  the same again from the disk cache }
+procedure TMainForm.BenchAI(P: TPzPhoto);
+var
+  T0, E: Double;
+  i: Integer;
+  Why: string;
+  Img: Tpz_image;
+  M: Tpz_meta;
+
+  function WaitAI(Lvl: Integer; TimeoutSec: Double): Double;
+  var
+    En: TViewEntry;
+  begin
+    T0 := NowSeconds;
+    repeat
+      CheckSynchronize(0);
+      Application.ProcessMessages;
+      Sleep(2);
+      En := CacheFind(P, Lvl);
+      if (En <> nil) and (AIFind(AIKey(P, akDenoise, En.Img.w, En.Img.h)) <> nil) then
+        Break;
+    until NowSeconds - T0 > TimeoutSec;
+    Result := (NowSeconds - T0) * 1000;
+  end;
+
+begin
+  if not PzAIReady(akDenoise, Why) then
+  begin
+    BLog('  AI: ' + Why);
+    Exit;
+  end;
+  BLog(Format('  AI denoise on %s (%dx%d):', [P.Name, P.W, P.H]));
+  for i := 0 to Cache.Count - 1 do
+    TViewEntry(Cache[i]).Free;
+  Cache.Clear;
+  SetEditMode(True);
+  ShowPhoto(P);
+  BenchWait(BC_VIEWFULL, 30, E);
+  SetDenoise(True, 0.8, False);
+  BLog(Format('    screen size, computed          %8.0f ms', [WaitAI(2, 120)]));
+  Viewer.Zoom100 := True;
+  RequestFull(P, True);
+  RenderCurrent;
+  BLog(Format('    full resolution, computed      %8.0f ms', [WaitAI(3, 600)]));
+  { again, from the disk cache only }
+  for i := 0 to FAICache.Count - 1 do
+    TPzAIJob(FAICache[i]).Free;
+  FAICache.Clear;
+  RenderCurrent;
+  BLog(Format('    full resolution, disk cache    %8.0f ms', [WaitAI(3, 60)]));
+  Viewer.Zoom100 := False;
+  { the export path: synchronous, in this thread, at full resolution }
+  PzInit(Img);
+  if pz_load(PAnsiChar(P.Path), 0, 0, RawFlags or PZ_RAW_FULL, @Img, @M) >= 0 then
+  begin
+    T0 := NowSeconds;
+    PzAIApplyChain(Img, P.Filters, nil);
+    BLog(Format('    export path (PzAIApplyChain)   %8.0f ms  %s', [(NowSeconds - T0) * 1000,
+      IfThen(PzAILastError = '', 'ok', PzAILastError)]));
+    pz_free(@Img);
+  end;
+  PzAICloseThread;
+  SetDenoise(False, 0, False);
+  SetEditMode(False);
 end;
 
 procedure TMainForm.RunBench;
@@ -416,7 +483,10 @@ begin
   if F = nil then
     F := FindFolder(Lib, '', 4, 1); // a small test library
   if F <> nil then
+  begin
     BenchEdit(F.Photo(3));
+    BenchAI(F.Photo(3));
+  end;
   F := FindFolder(Lib, 'Pixel7', 25, 0);
   if F = nil then
     F := FindFolder(Lib, '', 25, 0);

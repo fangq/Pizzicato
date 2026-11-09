@@ -53,6 +53,7 @@ ASTYLE_OPTS  = --style=attach --indent=spaces=4 --indent-modifiers --indent-swit
                --preserve-date --suffix=none --formatted --break-blocks
 JCF         ?= $(HOME)/.local/bin/jcf
 JCFCFG      := $(CURDIR)/tools/jcfsettings.cfg
+JCFRUN      ?= xvfb-run -a
 # include fragments (method bodies) cannot be parsed by JCF on their own
 PAS_SRC      = $(wildcard src/*.pas src/*.lpr tests/*.pas)
 
@@ -63,9 +64,11 @@ pretty-c:
 
 pretty-pas:
 	@test -x "$(JCF)" || { echo "JCF not found at $(JCF)"; exit 1; }
-	@for f in $(PAS_SRC); do \
-	  $(JCF) -clarify -inplace -y -config=$(JCFCFG) "$$f" >/dev/null 2>&1 || echo "JCF failed: $$f"; \
-	done
+	@# JCF is an LCL program: give it a private X server, never the desktop
+	@# (on a live remote desktop it can open there and wait on a dialog)
+	@$(JCFRUN) sh -c 'for f in $(PAS_SRC); do \
+	  timeout 120 $(JCF) -clarify -inplace -y -config=$(JCFCFG) "$$f" >/dev/null 2>&1 || echo "JCF failed: $$f"; \
+	done'
 	@echo "  PRETTY  Pascal sources"
 
 test: build/test_ini

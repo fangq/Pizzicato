@@ -573,6 +573,108 @@ def _(c):
         bar(c, x, 56, x, 102, RED, W * 0.6)
 
 
+
+def sparkle(c, cx, cy, r, stops=GOLD):
+    """a four-pointed AI sparkle"""
+    c.move_to(cx, cy - r)
+    for k in range(4):
+        a0 = -math.pi / 2 + k * math.pi / 2
+        a1 = a0 + math.pi / 4
+        a2 = a0 + math.pi / 2
+        c.line_to(cx + 0.22 * r * math.cos(a1), cy + 0.22 * r * math.sin(a1))
+        c.line_to(cx + r * math.cos(a2), cy + r * math.sin(a2))
+    c.close_path()
+    c.set_source(grad(stops, cx - r, cy - r, cx + r, cy + r))
+    c.fill_preserve()
+    stroke(c, ORANGE, W * 0.35)
+
+
+def person(c, cx, cy, r, stops=BLUE):
+    c.arc(cx, cy - r * 0.9, r * 0.55, 0, 2 * math.pi)
+    c.set_source(grad(stops, cx - r, cy - 2 * r, cx + r, cy))
+    c.fill()
+    c.arc(cx, cy + r * 1.25, r * 1.05, math.pi, 2 * math.pi)
+    c.close_path()
+    c.set_source(grad(stops, cx - r, cy, cx + r, cy + 2 * r))
+    c.fill()
+
+
+@icon("denoise")  # AI denoise: grain on the left, smooth on the right
+def _(c):
+    photo(c, 8, 30, 96, 76, sun=None)
+    c.save()
+    rrect(c, 8, 30, 48, 76, 14)
+    c.clip()
+    import random
+    rnd = random.Random(7)
+    for _k in range(70):
+        x, y = 10 + rnd.random() * 44, 32 + rnd.random() * 72
+        c.arc(x, y, 1.8 + rnd.random() * 1.6, 0, 2 * math.pi)
+        c.set_source_rgba(0.15, 0.15, 0.25, 0.55)
+        c.fill()
+    c.restore()
+    sparkle(c, 100, 28, 24)
+
+
+@icon("upscale")  # AI upscale: a small and a large frame with an arrow
+def _(c):
+    rrect(c, 10, 66, 42, 42, 8)
+    pale(c)
+    stroke(c, BLUE, W * 0.8)
+    rrect(c, 34, 22, 84, 84, 12)
+    stroke(c, BLUE, W * 0.8)
+    bar(c, 56, 84, 92, 48, GREEN, W)
+    head_arrow = [(92, 48), (70, 48), (92, 70)]
+    c.move_to(*head_arrow[1])
+    c.line_to(*head_arrow[0])
+    c.line_to(*head_arrow[2])
+    stroke(c, GREEN, W)
+    sparkle(c, 22, 26, 18)
+
+
+@icon("remove")  # remove an object: an eraser over a photo
+def _(c):
+    photo(c, 6, 18, 92, 72, sun=ORANGE)
+    c.save()
+    c.translate(84, 86)
+    c.rotate(-math.pi / 4)
+    rrect(c, -34, -16, 68, 32, 8)
+    c.set_source(grad(RED, -34, -16, 34, 16))
+    c.fill()
+    rrect(c, 6, -16, 28, 32, 6)
+    c.set_source_rgb(1, 1, 1)
+    c.fill()
+    rrect(c, -34, -16, 68, 32, 8)
+    stroke(c, RED, W * 0.5)
+    c.restore()
+    sparkle(c, 26, 102, 16)
+
+
+@icon("subject")  # select subject: a person inside a dashed frame
+def _(c):
+    person(c, 64, 60, 26, GREEN)
+    c.set_dash([10, 8])
+    rrect(c, 14, 12, 100, 104, 14)
+    stroke(c, BLUE, W * 0.6)
+    c.set_dash([])
+    sparkle(c, 104, 22, 18)
+
+
+@icon("people")  # people / faces
+def _(c):
+    person(c, 44, 58, 22, BLUE)
+    person(c, 86, 64, 24, GREEN)
+
+
+@icon("smartsearch")  # describe-it search: a magnifier with a sparkle
+def _(c):
+    c.arc(54, 56, 34, 0, 2 * math.pi)
+    pale(c)
+    stroke(c, BLUE, W)
+    bar(c, 80, 82, 112, 114, BLUE, W * 1.4)
+    sparkle(c, 54, 56, 20)
+
+
 def render(name, size):
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
     c = cairo.Context(surf)

@@ -103,6 +103,7 @@ uses
 {$linklib z}
 {$linklib gomp}
 {$linklib stdc++}
+{$linklib gcc_s}
 {$linklib m}
 
 procedure PzInit(out img: Tpz_image);

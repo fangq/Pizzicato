@@ -11,3 +11,4 @@ core/pzai_cli
 core/.ai-*
 third_party/mnn
 third_party/mnn-build/
+link*.res
