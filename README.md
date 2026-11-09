@@ -67,6 +67,11 @@ pixel kernels).
     in the background. People and unnamed groups are listed at the top of the
     folder tree. Naming a group writes Picasa's own `faces=` and
     `[Contacts2]` entries, and the search box finds people by name.
+  * **Scene summaries**: SmolVLM-256M, a small vision-language model,
+    describes every photo in one sentence ("A boy is eating with
+    chopsticks."), from its thumbnail, in the background. The Properties
+    panel shows it as "Scene", and the search box searches it. It is kept in
+    the thumbnail DB only, never written to the photo's `caption=`.
 
 ## Build
 
@@ -89,10 +94,16 @@ The build produces `./pizzicato`. The C core and its benchmark tool are in
 
 ### AI tools
 
-    tools/fetch_mnn.sh       # builds MNN with OpenCL into third_party/mnn
+    tools/fetch_mnn.sh       # builds MNN with OpenCL and MNN-LLM into third_party/mnn
                              # (or: ln -s <an MNN already staged> third_party/mnn)
     tools/fetch_models.sh    # downloads + converts the models (needs `pip install MNN onnx`)
     make AI=1
+
+The scene captioner is exported by MNN-LLM's `llmexport.py`, which needs
+torch (the CPU build will do) and transformers 4.5x:
+`PZ_LLM_PYTHON=/path/to/venv/bin/python tools/fetch_models.sh smolvlm`.
+It also needs an MNN built with MNN-LLM (`fetch_mnn.sh`'s default,
+`MNN_LLM=1`). An MNN without it still runs every other AI tool.
 
 The models go to `~/.local/share/pizzicato/models` (`PZ_MODELS` overrides).
 GPU auto-tuning caches go next to the thumbnail DB. `PZ_AI_GPU=1` or
@@ -101,7 +112,8 @@ the CPU. Plain `make` builds without MNN, and the AI tools then say so.
 
 All the models have GPL-compatible licences: NAFNet (MIT), SCUNet
 (Apache-2.0), Real-ESRGAN (BSD-3), MobileSAM (Apache-2.0), LaMa (Apache-2.0),
-CLIP ViT-B/32 (MIT), YuNet (MIT) and SFace (Apache-2.0).
+CLIP ViT-B/32 (MIT), YuNet (MIT), SFace (Apache-2.0) and SmolVLM-256M
+(Apache-2.0).
 `tests/ai_parity.py` and `tests/clip_parity.py` check the converted models
 against onnxruntime.
 
@@ -160,11 +172,12 @@ the top of `src/pzrender.pas` and in `core/pzcore.c`.
 
     core/pzcore.c      decoders, TIFF/EXIF/MakerNote walker, resampler, filters (OpenMP)
     core/pzbench.c     command-line timing tool for the core
-    core/pzai.cpp      AI models on MNN (tiling, CLIP, faces, SAM, LaMa); C ABI in pzai.h
+    core/pzai.cpp      AI models on MNN (tiling, CLIP, faces, SAM, LaMa, SmolVLM); C ABI in pzai.h
     core/pzai_stub.c   the same API without MNN (plain `make`); core/pzai_cli = test tool
     src/pzai.pas       AI bindings, the GPU worker thread, denoise/remove/upscale
     src/pzsearch.pas   smart search: CLIP indexer + in-memory int8 index
     src/pzfaces.pas    People: face indexer, groups, persons
+    src/pzcaption.pas  scene summaries: SmolVLM caption indexer
     src/pzcorebind.pas Pascal bindings
     src/pzini.pas      .picasa.ini + filter chain model
     src/pzrender.pas   filter chain -> pixel ops

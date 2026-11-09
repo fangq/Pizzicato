@@ -118,7 +118,36 @@ model_faces() { # People: YuNet detection (MIT) and SFace recognition (Apache-2.
     convert "$SRC/face/sface.onnx" face_sface.mnn
 }
 
-ALL=(nafnet scunet esrgan mobilesam lama clip faces)
+model_smolvlm() { # scene captions (Apache-2.0, HuggingFaceTB/SmolVLM-256M-Instruct)
+    # Exported with MNN-LLM's llmexport.py (8-bit weights) into
+    # $PZ_MODELS/smolvlm256m/. Needs a Python with torch (the CPU build is
+    # enough) and transformers 4.5x: PZ_LLM_PYTHON, default python3; and
+    # MNN's source tree (tools/fetch_mnn.sh unpacks it): PZ_MNN_SRC.
+    local out="$PZ_MODELS/smolvlm256m" py="${PZ_LLM_PYTHON:-python3}"
+    [[ -f "$out/visual.mnn" && -f "$out/llm.mnn" ]] && return 0
+    local rev=7e3e67edbbed1bf9888184d9df282b700a323964
+    local u=$HF/HuggingFaceTB/SmolVLM-256M-Instruct/resolve/$rev d="$SRC/smolvlm256m" f
+    fetch "$u/model.safetensors" "$d/model.safetensors" \
+        74dea5904032e5ae99a2e0eef5179e6ac0f1dedc3ab0c7c2a5d4d387c843203e
+    for f in config.json generation_config.json preprocessor_config.json processor_config.json \
+        chat_template.json tokenizer.json tokenizer_config.json special_tokens_map.json \
+        added_tokens.json vocab.json merges.txt; do
+        [[ -f "$d/$f" ]] || curl -fL --retry 3 -o "$d/$f" "$u/$f"
+    done
+    local mnnsrc="${PZ_MNN_SRC:-$(ls -d "$(cd "$(dirname "$0")/.." && pwd)"/third_party/mnn-build/MNN-*/ 2>/dev/null | head -1)}"
+    [[ -f "$mnnsrc/transformers/llm/export/llmexport.py" ]] ||
+        { echo "MNN source not found: set PZ_MNN_SRC (tools/fetch_mnn.sh unpacks it)" >&2; exit 1; }
+    "$py" -c 'import torch, transformers' ||
+        { echo "smolvlm needs torch + transformers: set PZ_LLM_PYTHON" >&2; exit 1; }
+    echo "[fetch_models] exporting SmolVLM-256M -> smolvlm256m/"
+    # (from $d: the exporter leaves an .export.log in the current directory)
+    (cd "$d" && "$py" "$mnnsrc/transformers/llm/export/llmexport.py" --path "$d" --export mnn \
+        --quant_bit 8 --quant_block 64 --dst_path "$out" --mnnconvert "${CONVERT:-none}") \
+        >"$out.log" 2>&1
+    rm -rf "$out/onnx"
+}
+
+ALL=(nafnet scunet esrgan mobilesam lama clip faces smolvlm)
 for m in "${@:-${ALL[@]}}"; do
     "model_$m"
 done

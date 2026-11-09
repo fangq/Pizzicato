@@ -15,6 +15,11 @@
 #include <MNN/Tensor.hpp>
 #include <MNN/expr/ExprCreator.hpp>
 #include <MNN/expr/Module.hpp>
+/* MNN-LLM (tools/fetch_mnn.sh MNN_LLM=1) runs the SmolVLM captioner */
+#if __has_include(<llm/llm.hpp>)
+#include <llm/llm.hpp>
+#define PZ_HAVE_LLM 1
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -62,6 +67,10 @@ struct pz_ai {
        Module instead of a session */
     std::shared_ptr<MNN::Express::Module> mod[8]; /* SAM: by point count */
     std::string dec_base;
+#ifdef PZ_HAVE_LLM
+    /* the scene captioner (SmolVLM, a vision-language model) */
+    MNN::Transformer::Llm* llm = nullptr;
+#endif
 };
 
 extern "C" int pz_ai_available(void) {
@@ -328,6 +337,12 @@ extern "C" void pz_ai_close(pz_ai* h) {
     if (h->sess) {
         h->net->releaseSession(h->sess);
     }
+
+#ifdef PZ_HAVE_LLM
+    if (h->llm) {
+        MNN::Transformer::Llm::destroy(h->llm);
+    }
+#endif
 
     delete h;
 }
@@ -1673,4 +1688,220 @@ extern "C" int pz_ai_inpaint(pz_ai* h, pz_image* img, const unsigned char* mask)
 
     pz_free(&rb);
     return 0;
+}
+
+/* ---- scene captions: SmolVLM-256M through MNN-LLM ---- */
+
+/* the caption prompt; SmolVLM answers in one or two plain sentences */
+#define PZ_CAPTION_PROMPT "Describe this photo in one sentence."
+/* the vision tower's input edge: one global 512 x 512 view (no tiling) */
+#define PZ_CAPTION_EDGE 512
+
+/* the longest caption, in tokens (SmolVLM's are 10-30) */
+#define CAPTION_TOKENS 48
+
+/* SmolVLM's captions open with "In this image we can see ..." and the
+   like: drop that, so the caption reads as a description (and a search
+   for "image" does not match every photo); one line; a caption cut off by
+   CAPTION_TOKENS ends at its last full sentence */
+static std::string tidy_caption(std::string s, bool cut_off) {
+    static const char* lead[] = {
+        "in this image, we can see ", "in this image we can see ", "in this picture we can see ",
+        "in this image i can see ", "in this picture i can see ", "in the image we can see ",
+        "in this image, there is ", "in this image, there are ", "in this image there is ",
+        "in this image there are ", "in this picture there is ", "in this picture there are ",
+        "in this image we can see that ", "this picture shows ", "this image shows ",
+        "this is an image of ", "this is a picture of ", "the image shows ", "this is a photo of ",
+        "in this image, ", "in this picture, ", "in this image ", "in this picture ",
+    };
+
+    for (auto& c : s) {
+        if (c == '\n' || c == '\r' || c == '\t') {
+            c = ' ';
+        }
+    }
+
+    size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+    s = a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+
+    std::string low = s;
+
+    for (auto& c : low) {
+        c = (char)tolower((unsigned char)c);
+    }
+
+    for (const char* l : lead) {
+        size_t n = strlen(l);
+
+        if (low.compare(0, n, l) == 0 && s.size() > n + 2) {
+            s = s.substr(n);
+            break;
+        }
+    }
+
+    if (!s.empty() && s[0] >= 'a' && s[0] <= 'z') {
+        s[0] = (char)(s[0] - 'a' + 'A');
+    }
+
+    if (cut_off) {
+        size_t dot = s.rfind(". ");
+
+        if (dot != std::string::npos) {
+            s.resize(dot + 1);
+        } else if (s.empty() || s.back() != '.') {
+            size_t sp = s.rfind(' ');
+
+            if (sp != std::string::npos) {
+                s.resize(sp);
+            }
+
+            while (!s.empty() && (s.back() == ',' || s.back() == ' ')) {
+                s.pop_back();
+            }
+
+            s += "...";
+        }
+    }
+
+    return s;
+}
+
+extern "C" int pz_ai_caption_open(const char* dir, int device, pz_ai** out) {
+    *out = nullptr;
+#ifndef PZ_HAVE_LLM
+    (void)dir;
+    (void)device;
+    return fail("this MNN was built without MNN-LLM (tools/fetch_mnn.sh MNN_LLM=1)");
+#else
+    std::string cfg = std::string(dir) + "/config.json";
+    struct stat st;
+
+    if (stat(cfg.c_str(), &st) != 0) {
+        return fail("no captioner at " + cfg);
+    }
+
+    const bool gpu = device == PZ_AI_OPENCL;
+    const char* be = gpu ? "opencl" : "cpu";
+    const int nt = gpu ? 68 : 8; /* OpenCL: 64 = buffer memory, 4 = fast tuning */
+
+    /* MNN-LLM reads the vision tower's backend ("mllm") only from the
+       config file, so write a config for this backend that points back at
+       the model (base_dir); it also keeps the OpenCL tuning cache. Greedy
+       decoding: the same photo always gets the same caption. */
+    std::string tmp = (g_cache_dir.empty() ? std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp")
+                       : g_cache_dir) + "/smolvlm-" + be;
+    mkdirs(tmp);
+    std::string mine = tmp + "/config.json";
+    {
+        std::ofstream f(mine);
+        f << "{\"base_dir\":\"" << dir << "/\",\"llm_model\":\"llm.mnn\",\"llm_weight\":\"llm.mnn.weight\","
+          << "\"tokenizer_file\":\"tokenizer.mtok\",\"backend_type\":\"" << be << "\",\"thread_num\":" << nt << ","
+          << "\"precision\":\"low\",\"memory\":\"low\",\"sampler_type\":\"greedy\",\"max_new_tokens\":" << CAPTION_TOKENS << ","
+          << "\"tmp_path\":\"" << tmp << "\","
+          << "\"mllm\":{\"backend_type\":\"" << be << "\",\"thread_num\":" << nt << ","
+          << "\"precision\":\"" << (gpu ? "low" : "normal") << "\",\"memory\":\"low\"}}\n";
+
+        if (!f) {
+            mine = cfg; /* cannot write: the model's own (CPU) config */
+        }
+    }
+
+    std::unique_ptr<pz_ai> h(new pz_ai);
+    h->generic = true;
+    h->llm = MNN::Transformer::Llm::createLLM(mine);
+
+    if (!h->llm) {
+        return fail("cannot read " + mine);
+    }
+
+    if (!h->llm->load()) {
+        return fail("cannot load the captioner in " + std::string(dir));
+    }
+
+    h->backend = gpu ? "opencl" : "cpu";
+    *out = h.release();
+    return 0;
+#endif
+}
+
+extern "C" int pz_ai_caption(pz_ai* h, const pz_image* img, char* text, int max) {
+    if (max > 0) {
+        text[0] = 0;
+    }
+#ifndef PZ_HAVE_LLM
+    (void)h;
+    (void)img;
+    return fail("built without MNN-LLM");
+#else
+    using namespace MNN::Express;
+
+    if (!h || !h->llm) {
+        return fail("not a captioner");
+    }
+
+    if (!img || !img->px || img->w <= 0 || img->h <= 0) {
+        return fail("empty image");
+    }
+
+    /* shrink to about the vision tower's size here (cheap, and MNN's own
+       resize to 512 x 512 then only interpolates); BGRA -> BGR bytes */
+    const int E = PZ_CAPTION_EDGE;
+    pz_image small = {0, 0, nullptr};
+    const pz_image* src = img;
+
+    if (img->w > 2 * E || img->h > 2 * E) {
+        double f = (double)E / std::min(img->w, img->h);
+
+        if (pz_resize(img, std::max(1, (int)lrint(img->w * f)), std::max(1, (int)lrint(img->h * f)), &small) == 0) {
+            src = &small;
+        }
+    }
+
+    VARP v = _Input({src->h, src->w, 3}, NHWC, halide_type_of<uint8_t>());
+    uint8_t* d = v->writeMap<uint8_t>();
+    const size_t n = (size_t)src->w * src->h;
+
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = src->px[i];
+        d[3 * i] = p & 255;
+        d[3 * i + 1] = (p >> 8) & 255;
+        d[3 * i + 2] = (p >> 16) & 255;
+    }
+
+    pz_free(&small);
+
+    MNN::Transformer::MultimodalPrompt mp;
+    mp.prompt_template = "<img>photo</img>" PZ_CAPTION_PROMPT;
+    mp.images["photo"] = {v, E, E};
+
+    std::ostringstream os;
+    h->llm->reset(); /* every photo on its own, no chat history */
+    h->llm->response(mp, &os, "");
+
+    auto ctx = h->llm->getContext();
+
+    if (!ctx || ctx->status == MNN::Transformer::LlmStatus::INTERNAL_ERROR) {
+        return fail("the captioner failed");
+    }
+
+    if (getenv("PZ_AI_TIMING")) {
+        fprintf(stderr, "caption: vision %.0f ms, prefill %d tok %.0f ms, decode %d tok %.0f ms\n",
+                ctx->vision_us / 1e3, ctx->prompt_len, ctx->prefill_us / 1e3, ctx->gen_seq_len,
+                ctx->decode_us / 1e3);
+    }
+
+    std::string s = tidy_caption(os.str(), ctx->gen_seq_len >= CAPTION_TOKENS);
+
+    /* cut at a word boundary when it does not fit */
+    if ((int)s.size() >= max) {
+        size_t cut = s.rfind(' ', max > 1 ? max - 1 : 0);
+        s.resize(cut != std::string::npos && cut > 0 ? cut : std::max(0, max - 1));
+    }
+
+    if (max > 0) {
+        memcpy(text, s.c_str(), s.size() + 1);
+    }
+
+    return 0;
+#endif
 }

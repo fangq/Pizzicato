@@ -447,7 +447,8 @@ begin
       for k := 0 to F.Count - 1 do
         F.Photo(k).FilterHit :=
           Pos(Low, LowerCase(F.Photo(k).Name + ' ' + F.Photo(k).Keywords +
-          ' ' + F.Photo(k).Caption + ' ' + F.Photo(k).People)) > 0;
+          ' ' + F.Photo(k).Caption + ' ' + F.Photo(k).People + ' ' +
+          F.Photo(k).Scene)) > 0;
     end;
     if FStarOnly then
       F.EnsureIni;

@@ -64,6 +64,7 @@ type
     SmartHit: Boolean;   // matches the search by description (CLIP)
     PersonHit: Boolean;  // shows the person picked in People
     People: string;      // names of the people in it, for the search box
+    Scene: string;       // the captioner's one-line description (DB only)
     { tags: Picasa's comma-separated keywords= }
     Keywords: string;
     Caption: string;     // Picasa's caption=
@@ -846,6 +847,8 @@ begin
   Exec('CREATE TABLE IF NOT EXISTS thumbs(id INTEGER PRIMARY KEY, data BLOB)');
   { CLIP embeddings of the thumbnails, for search by description (pzsearch) }
   Exec('CREATE TABLE IF NOT EXISTS clip(id INTEGER PRIMARY KEY, emb BLOB)');
+  { the captioner's descriptions of the thumbnails (pzcaption) }
+  Exec('CREATE TABLE IF NOT EXISTS captions(id INTEGER PRIMARY KEY, text TEXT)');
   { databases from before 'hidden': add it, and re-list every folder once so
     the scanner picks the flags up from the .picasa.ini files }
   if sqlite3_exec(FDB, 'ALTER TABLE photos ADD COLUMN hidden INTEGER DEFAULT 0',
@@ -921,6 +924,7 @@ begin
     Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
     Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
     Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
+    Exec('DELETE FROM captions WHERE id=' + IntToStr(P.Id));
   finally
     FDBLock.Leave;
   end;
@@ -1387,6 +1391,7 @@ begin
             sqlite3_finalize(St);
             Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
             Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
+            Exec('DELETE FROM captions WHERE id=' + IntToStr(P.Id));
           end;
         end
         else
@@ -1422,6 +1427,7 @@ begin
         Exec('DELETE FROM photos WHERE id=' + IntToStr(P.Id));
         Exec('DELETE FROM thumbs WHERE id=' + IntToStr(P.Id));
         Exec('DELETE FROM clip WHERE id=' + IntToStr(P.Id));
+        Exec('DELETE FROM captions WHERE id=' + IntToStr(P.Id));
         P.Folder := F;
         P.Removed := True;
         FGraveyard.Add(P);

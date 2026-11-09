@@ -95,6 +95,8 @@ background, as Picasa does. At most two full-resolution images are cached.
 | CLIP | one smart-search query over 107,582 photos | 26–28 ms (the first 0.4 s: loading the text tower) |
 | YuNet + SFace | face detection on a 1600 px photo | 15–22 ms |
 | YuNet + SFace | People indexing of the real library (HDD, newest first) | 11.2 photos/s (the whole library: about 2.7 h in the background) |
+| SmolVLM-256M (8-bit, MNN-LLM) | one scene caption from a 320 px thumbnail | 150–260 ms, 191 ms on average (CPU, 8 threads: about 400 ms) |
+| SmolVLM-256M | caption the real library from the thumbnails | 5.2 photos/s (the whole library: about 5.7 h in the background) |
 
 Parity of the converted models with onnxruntime (`tests/ai_parity.py`,
 `tests/clip_parity.py`):
@@ -130,8 +132,20 @@ On the real library, the first 2,000 photos scanned gave:
   at small, low-resolution face sizes;
 - profile views group less cleanly: one mixed two people.
 
-Florence-2 scene captions are not in yet: its decoder does not survive MNN's
-conversion (see the `wip-florence` branch).
+Scene captions: Florence-2's decoder computed wrongly after MNN's conversion
+(the `wip-florence` branch). SmolVLM-256M runs through MNN-LLM instead, and
+its captions match the PyTorch model's in content. Some captions from the
+real library: "Two men are standing and smiling in front of a car.", "An open
+refrigerator with a bunch of stickers and magnets attached to it.", "The
+inside of a train with many people sitting in seats.". Its weak points:
+lists ("A lake, trees, and the sky."), the odd wrong guess, and few words
+for a plain wall. It reads text too: "A boy is standing in front of a sign
+with the name "REVERE BEACH" on it."
+
+MNN-LLM pitfall: its vision tower takes its backend only from the config
+file (`set_config` changes the language model's). Pizzicato therefore
+writes its own config next to the tuning cache. Before that fix, the vision
+tower ran on the CPU at 320–520 ms; on the GPU it takes about 10 ms.
 
 ## Correctness checks
 

@@ -148,3 +148,21 @@ int pz_ai_inpaint(pz_ai* lama, pz_image* img, const unsigned char* mask) {
     (void)mask;
     return -1;
 }
+
+int pz_ai_caption_open(const char* dir, int device, pz_ai** h) {
+    (void)dir;
+    (void)device;
+    *h = NULL;
+    return -1;
+}
+
+int pz_ai_caption(pz_ai* h, const pz_image* img, char* text, int max) {
+    (void)h;
+    (void)img;
+
+    if (max > 0) {
+        text[0] = 0;
+    }
+
+    return -1;
+}

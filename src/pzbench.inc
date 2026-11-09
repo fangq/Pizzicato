@@ -436,7 +436,9 @@ var
   Img: Tpz_image;
   M: Tpz_meta;
   OutDir: string;
-  k: Integer;
+  k, j: Integer;
+const
+  CAP_QUERIES: array[0..2] of string = ('boat', 'rainbow', 'snow');
 begin
   if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'faces' then
   begin
@@ -464,12 +466,62 @@ begin
         FaceIdx.Faces, FaceIdx.Done, FaceIdx.Total, IfThen(FaceIdx.Error <> '', ' error ' + FaceIdx.Error, '')]));
     end;
     BLog('bench done');
+    Close;
+    Exit;
+  end;
+  if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'captions' then
+  begin
+    { the scene captioner for a while: photos/s, and a sample of captions }
+    StartCaptionIndex;
+    if CapIdx = nil then
+      BLog('captions: model missing')
+    else
+    begin
+      T0 := NowSeconds;
+      repeat
+        CheckSynchronize(0);
+        Application.ProcessMessages;
+        Sleep(100);
+      until (NowSeconds - T0 > StrToIntDef(GetEnvironmentVariable('PZ_BENCH_SECS'), 180)) or
+        (CapIdx.Error <> '') or ((CapIdx.Total > 0) and (CapIdx.Done >= CapIdx.Total));
+      BLog(Format('captions (%s): %d photos in %.1f s captioning (%.0f ms each), %d / %d done%s',
+        [CapIdx.Backend, CapIdx.Made, CapIdx.Seconds, 1000 * CapIdx.Seconds / Max(1, CapIdx.Made),
+        CapIdx.Done, CapIdx.Total, IfThen(CapIdx.Error <> '', ' error ' + CapIdx.Error, '')]));
+      LoadCaptions;
+      n := 0;
+      for k := 0 to Lib.Folders.Count - 1 do
+        with TPzFolder(Lib.Folders[k]) do
+          for i := Count - 1 downto 0 do
+            if (Photo(i).Scene <> '') and (n < 40) and (Random(20) = 0) then
+            begin
+              BLog('  ' + Name + '/' + Photo(i).Name + ': ' + Photo(i).Scene);
+              Inc(n);
+            end;
+      { the search box over captions }
+      for k := 0 to 2 do
+      begin
+        T0 := NowSeconds;
+        EdSearch.Text := CAP_QUERIES[k];
+        Grid.Filter := EdSearch.Text;
+        n := 0;
+        for i := 0 to Lib.Folders.Count - 1 do
+          with TPzFolder(Lib.Folders[i]) do
+            for j := 0 to Count - 1 do
+              if Photo(j).FilterHit then
+                Inc(n);
+        BLog(Format('  search "%s": %d photos in %.0f ms', [EdSearch.Text, n,
+          (NowSeconds - T0) * 1000]));
+      end;
+    end;
+    BLog('bench done');
+    Close;
     Exit;
   end;
   if GetEnvironmentVariable('PZ_BENCH_ONLY') = 'search' then
   begin
     BenchSearch; // PZ_BENCH_ONLY=search: just index and query
     BLog('bench done');
+    Close;
     Exit;
   end;
   BLog(Format('window shown; roots=%s; workers=%d; grid %dx%d thumb %d',

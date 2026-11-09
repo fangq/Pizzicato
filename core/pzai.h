@@ -97,6 +97,14 @@ int  pz_ai_sam_mask(pz_ai* dec, const float* emb, int w, int h, const float* pts
  * and the result is blended back with a soft edge. In place. */
 int  pz_ai_inpaint(pz_ai* lama, pz_image* img, const unsigned char* mask);
 
+/* ---- scene captions (SmolVLM-256M on MNN-LLM) ----
+ * dir holds the MNN-LLM export (config.json, llm.mnn, visual.mnn, ...).
+ * Needs an MNN built with MNN_LLM=1; otherwise open fails. */
+int  pz_ai_caption_open(const char* dir, int device, pz_ai** h);
+/* a one-sentence description of img into text (UTF-8, at most max bytes
+ * with the NUL); the same photo always gets the same caption */
+int  pz_ai_caption(pz_ai* h, const pz_image* img, char* text, int max);
+
 #ifdef __cplusplus
 }
 #endif

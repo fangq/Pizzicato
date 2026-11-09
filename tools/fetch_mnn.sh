@@ -59,6 +59,9 @@ MNN_VULKAN="${MNN_VULKAN:-0}"
 # time inside the .a) but the final stripped siamize binary is
 # typically smaller than `siamize + libMNN.so` because the linker
 # can drop unreferenced MNN objects.
+# MNN_LLM=1 (default) also builds MNN-LLM (transformers/llm) into libMNN, which
+# runs the SmolVLM scene captioner; MNN_LLM=0 leaves it out.
+MNN_LLM="${MNN_LLM:-1}"
 MNN_STATIC="${MNN_STATIC:-0}"  # Pizzicato links the shared libMNN (rpath)
 FORCE="${FORCE:-0}"
 
@@ -98,7 +101,7 @@ fi
 # FORCE=1. The stamp records the knobs that change what libMNN contains, so
 # e.g. re-running with MNN_VULKAN=1 over an OpenCL-only stage rebuilds
 # instead of silently keeping a library without the Vulkan backend.
-BUILD_STAMP="ref=$MNN_REF opencl=$MNN_OPENCL vulkan=$MNN_VULKAN static=$MNN_STATIC"
+BUILD_STAMP="ref=$MNN_REF opencl=$MNN_OPENCL vulkan=$MNN_VULKAN static=$MNN_STATIC llm=$MNN_LLM"
 STAMP_FILE="$MNN_STAGE/.fetch_mnn_config"
 if [[ "$FORCE" == "0" && -f "$MNN_STAGE/include/MNN/Interpreter.hpp" && -f "$MNN_STAGE/lib/$LIB_NAME" \
       && "$(cat "$STAMP_FILE" 2>/dev/null)" == "$BUILD_STAMP" ]]; then
@@ -211,6 +214,14 @@ fi
 if [[ "$MNN_VULKAN" == "1" ]]; then
     CMAKE_FLAGS+=(-DMNN_VULKAN=ON -DMNN_VULKAN_IMAGE=OFF)
 fi
+if [[ "$MNN_LLM" == "1" ]]; then
+    # LLM + vision-language (omni) runtime, int4/int8 weight kernels, the
+    # fused attention ops, and MNN's small cv/imgcodecs used by the vision
+    # preprocessing. All folded into libMNN (SEP_BUILD=OFF).
+    CMAKE_FLAGS+=(-DMNN_BUILD_LLM=ON -DMNN_BUILD_LLM_OMNI=ON -DMNN_LOW_MEMORY=ON
+                  -DMNN_CPU_WEIGHT_DEQUANT_GEMM=ON -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+                  -DMNN_BUILD_OPENCV=ON -DMNN_IMGCODECS=ON)
+fi
 
 # Pin the compiler explicitly when CC / CXX are exported. cmake only reads
 # CC/CXX from the environment on a *fresh* build dir, which is fragile in CI
@@ -272,6 +283,9 @@ find_built() {
 # Stage headers + library at third_party/mnn/.
 echo "[fetch_mnn] staging headers"
 cp -r "$SRC_DIR/include/MNN" "$MNN_STAGE/include/"
+if [[ "$MNN_LLM" == "1" ]]; then
+    cp -r "$SRC_DIR/transformers/llm/engine/include/llm" "$MNN_STAGE/include/"
+fi
 
 echo "[fetch_mnn] staging $LIB_NAME"
 case "$LIB_NAME" in

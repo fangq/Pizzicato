@@ -8,6 +8,7 @@
  *   pzai_cli [-d ...] --clip-image vision.mnn photo.jpg out.f32
  *   pzai_cli [-d ...] --clip-text text.mnn vocab.json merges.txt "words" out.f32
  *   pzai_cli [-d ...] --faces yunet.mnn sface.mnn photo out.txt   (boxes + embeddings)
+ *   pzai_cli [-d ...] --caption smolvlm_dir photo...   (one caption per photo)
  *   pzai_cli [-d ...] --remove sam_enc.mnn sam_dec.mnn lama.mnn photo "x,y" out.jpg
  *       (select the subject at x,y -- 0..1 of the photo -- and remove it;
  *        also writes out.jpg.mask.png-like out.mask.pgm)
@@ -41,7 +42,7 @@ static int progress(void* user, int done, int total) {
 
 int main(int argc, char** argv) {
     int device = PZ_AI_OPENCL, tile = 0, overlap = 32, quality = 95, raw = 0, clip = 0, i;
-    const char* a[7];
+    const char* a[64];
     int na = 0;
 
     for (i = 1; i < argc; i++) {
@@ -64,9 +65,50 @@ int main(int argc, char** argv) {
             clip = 3;
         } else if (!strcmp(argv[i], "--remove")) {
             clip = 4;
-        } else if (na < 7) {
+        } else if (!strcmp(argv[i], "--caption")) {
+            clip = 5;
+        } else if (na < 64) {
             a[na++] = argv[i];
         }
+    }
+
+    if (clip == 5 && na >= 2) {
+        pz_ai* h;
+        double t0 = now();
+        int k;
+
+        if (pz_ai_caption_open(a[0], device, &h) != 0) {
+            fprintf(stderr, "open: %s\n", pz_ai_error());
+            return 1;
+        }
+
+        fprintf(stderr, "captioner (%s) open %.0f ms\n", pz_ai_backend(h), (now() - t0) * 1e3);
+
+        for (k = 1; k < na; k++) {
+            pz_image img = {0, 0, NULL};
+            pz_meta meta;
+            char txt[512];
+
+            if (pz_load(a[k], 1024, 1024, 0, &img, &meta) != 0) {
+                fprintf(stderr, "cannot load %s\n", a[k]);
+                continue;
+            }
+
+            t0 = now();
+
+            if (pz_ai_caption(h, &img, txt, sizeof(txt)) != 0) {
+                fprintf(stderr, "caption: %s\n", pz_ai_error());
+                pz_free(&img);
+                pz_ai_close(h);
+                return 1;
+            }
+
+            printf("%.0f ms  %s  %s\n", (now() - t0) * 1e3, a[k], txt);
+            pz_free(&img);
+        }
+
+        pz_ai_close(h);
+        return 0;
     }
 
     if (na < 3) {

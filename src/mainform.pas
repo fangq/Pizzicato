@@ -11,7 +11,8 @@ uses
   Classes, SysUtils, Forms, Controls, Graphics, StdCtrls, ExtCtrls, ComCtrls, Dialogs,
   LCLType, LCLIntf, IniFiles, Math, StrUtils, Menus, DateUtils, Clipbrd, LCLProc,
   Buttons, ImgList, gdk2,
-  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai, pzsearch, pzfaces, md5;
+  pzcorebind, pzini, pzrender, pzlibrary, pzviews, pzicons, pzai,
+  pzsearch, pzfaces, pzcaption, md5;
 
 type
   TViewEntry = class
@@ -53,6 +54,9 @@ type
     PmPeople: TPopupMenu;
     MiPeopleName: TMenuItem;
     FPeopleTick: Integer;
+    { scene summaries }
+    CapIdx: TPzCaptionIndex;
+    FCapSeen: Integer;     // CapIdx.Added when the photos last got captions
     ImgSearch, ImgSize: TImage;
     TabIcons: TImageList;
     FEffNames: TStringList;  // filter name of each effect button, by Tag
@@ -151,6 +155,8 @@ type
     procedure SmartSearch;
     procedure StartClipIndex;
     procedure StartFaceIndex;
+    procedure StartCaptionIndex;
+    procedure LoadCaptions;
     function PhotoMap: TList;
     procedure RebuildPeople;
     procedure LoadPeopleNames;
@@ -1084,6 +1090,9 @@ begin
   StartFaceIndex;
   if FaceIdx <> nil then
     FaceIdx.Kick;
+  StartCaptionIndex;
+  if CapIdx <> nil then
+    CapIdx.Kick;
   RebuildTree;
   Grid.Relayout;
   if not FBench and not FGenAll then
@@ -1127,6 +1136,45 @@ begin
   end;
   FPeopleNode := nil;
   RebuildPeople;
+end;
+
+{ ---------------- scene summaries ---------------- }
+
+procedure TMainForm.StartCaptionIndex;
+var
+  Why: string;
+begin
+  if (CapIdx = nil) and not FGenAll and PzCaptionReady(Why) then
+    CapIdx := TPzCaptionIndex.Create(FDBPath);
+end;
+
+{ give the photos their captions, for the search box; a search in
+  progress is redone so that new matches show up }
+procedure TMainForm.LoadCaptions;
+var
+  T: TStringArray;
+  i, k: Integer;
+  F: TPzFolder;
+  P: TPzPhoto;
+begin
+  if CapIdx = nil then
+    Exit;
+  FCapSeen := CapIdx.Added;
+  T := CapIdx.Snapshot;
+  for i := 0 to Lib.Folders.Count - 1 do
+  begin
+    F := TPzFolder(Lib.Folders[i]);
+    for k := 0 to F.Count - 1 do
+    begin
+      P := F.Photo(k);
+      if (P.Id >= 0) and (P.Id < Length(T)) and (T[P.Id] <> '-') then
+        P.Scene := T[P.Id]
+      else
+        P.Scene := '';
+    end;
+  end;
+  if Trim(EdSearch.Text) <> '' then
+    Grid.Relayout;
 end;
 
 { ---------------- People ---------------- }
@@ -2983,6 +3031,12 @@ begin
   if (ClipIdx <> nil) and (ClipIdx.Total > 0) and (ClipIdx.Indexed < ClipIdx.Total) then
     S := S + Format('  Indexing for smart search %d / %d',
       [ClipIdx.Indexed, ClipIdx.Total]);
+  if (CapIdx <> nil) and (CapIdx.Total > 0) and (CapIdx.Done < CapIdx.Total) then
+    S := S + Format('  Describing photos %d / %d', [CapIdx.Done, CapIdx.Total]);
+  { new captions join the search now and then }
+  if (CapIdx <> nil) and (CapIdx.Added <> FCapSeen) and
+    ((FCapSeen = 0) or (FPeopleTick mod 30 = 0)) and not FEditMode then
+    LoadCaptions;
   if Grid.SmartOn then
     S := S + Format('  Smart search: %d photos', [FSmartN]);
   LblStatus.Caption := S;
@@ -3007,6 +3061,7 @@ begin
   FreeAndNil(ClipIdx);
   FreeAndNil(ClipText);
   FreeAndNil(FaceIdx);
+  FreeAndNil(CapIdx);
   FreeAndNil(FSam);
   if not PnlRight.Visible then
     Settings.WriteInteger('view', 'rightpanel', 0)
@@ -3527,6 +3582,9 @@ begin
       if E <> '' then
         LstProps.Items.Add('Looks like' + #9 + E);
     end;
+    { the captioner's description, for a single photo }
+    if (N = 1) and (TPzPhoto(L[0]).Scene <> '') then
+      LstProps.Items.Add('Scene' + #9 + TPzPhoto(L[0]).Scene);
     for i := 0 to NTop - 1 do Add(TPzPhoto(L[i]).Folder.Path);
     Field('Location');
     for i := 0 to NTop - 1 do
